@@ -1,8 +1,50 @@
-# 1.8.1 (2024-06-08 21:32)
+# 2.0.0 (alpha)
+
+### Feature
+
+* Added prisma orm, connection to postgres and mysql
+* Added chatwoot integration activation
+* Added typebot integration activation
+* Now you can register several typebots with triggers
+* Media sent to typebot now goes as a template string, example: imageMessage:MESSAGE_ID
+* Organization configuration and logo in chatwoot bot contact
+* Added debounce time for typebot messages
+* Tagging in chatwoot contact by instance
+
+### Fixed
+
+* Removed excessive verbose logs
+* Optimization in instance registration
+* Now in typebot we wait until the terminal block to accept the user's message, if it arrives before the block is sent, it is ignored
+* Correction of audio sending, now we can speed it up and have the audio wireframe
+* Reply with media message on Chatwoot
+
+### Break changes
+
+* jwt authentication removed
+* Connection to mongodb removed
+* Standardized all request bodies to use camelCase
+* Change in webhook information from owner to instanceId
+* Changed the .env file configuration, removed the yml version and added .env to the repository root
+* Removed the mobile type connection with Baileys
+* Simplified payloads and endpoints
+* Improved Typebot
+  - Now you can register several typebots
+  - Start configuration by trigger or for all
+  - Session search by typebot or remoteJid
+  - KeepOpen configuration (keeps the session even when the bot ends, to run once per contact)
+  - StopBotFromMe configuration, allows me to stop the bot if I send a chat message.
+
+# 1.8.1 (develop)
 
 ### Feature
 
 * New method of saving sessions to a file using worker, made in partnership with [codechat](https://github.com/code-chat-br/whatsapp-api)
+* Caching system for group data
+
+### Fixes
+
+* Correction of variables breaking lines in typebot
 
 ### Fixed
 

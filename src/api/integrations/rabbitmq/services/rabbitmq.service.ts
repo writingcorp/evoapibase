@@ -1,6 +1,7 @@
+import { Rabbitmq } from '@prisma/client';
+
 import { Logger } from '../../../../config/logger.config';
 import { InstanceDto } from '../../../dto/instance.dto';
-import { RabbitmqRaw } from '../../../models';
 import { WAMonitoringService } from '../../../services/monitor.service';
 import { RabbitmqDto } from '../dto/rabbitmq.dto';
 import { initQueues } from '../libs/amqp.server';
@@ -11,16 +12,14 @@ export class RabbitmqService {
   private readonly logger = new Logger(RabbitmqService.name);
 
   public create(instance: InstanceDto, data: RabbitmqDto) {
-    this.logger.verbose('create rabbitmq: ' + instance.instanceName);
     this.waMonitor.waInstances[instance.instanceName].setRabbitmq(data);
 
     initQueues(instance.instanceName, data.events);
     return { rabbitmq: { ...instance, rabbitmq: data } };
   }
 
-  public async find(instance: InstanceDto): Promise<RabbitmqRaw> {
+  public async find(instance: InstanceDto): Promise<Rabbitmq> {
     try {
-      this.logger.verbose('find rabbitmq: ' + instance.instanceName);
       const result = await this.waMonitor.waInstances[instance.instanceName].findRabbitmq();
 
       if (Object.keys(result).length === 0) {
@@ -29,7 +28,7 @@ export class RabbitmqService {
 
       return result;
     } catch (error) {
-      return { enabled: false, events: [] };
+      return null;
     }
   }
 }

@@ -8,11 +8,13 @@ import ChatwootClient, {
   inbox,
 } from '@figuro/chatwoot-sdk';
 import { request as chatwootRequest } from '@figuro/chatwoot-sdk/dist/core/request';
+import { Chatwoot as ChatwootModel, Contact as ContactModel, Message as MessageModel } from '@prisma/client';
 import { proto } from '@whiskeysockets/baileys';
 import axios from 'axios';
 import FormData from 'form-data';
 import { createReadStream, unlinkSync, writeFileSync } from 'fs';
 import Jimp from 'jimp';
+import Long from 'long';
 import mimeTypes from 'mime-types';
 import path from 'path';
 
@@ -22,12 +24,20 @@ import i18next from '../../../../utils/i18n';
 import { ICache } from '../../../abstract/abstract.cache';
 import { InstanceDto } from '../../../dto/instance.dto';
 import { Options, Quoted, SendAudioDto, SendMediaDto, SendTextDto } from '../../../dto/sendMessage.dto';
-import { ChatwootRaw, ContactRaw, MessageRaw } from '../../../models';
-import { RepositoryBroker } from '../../../repository/repository.manager';
+import { PrismaRepository } from '../../../repository/repository.service';
 import { WAMonitoringService } from '../../../services/monitor.service';
 import { Events } from '../../../types/wa.types';
 import { ChatwootDto } from '../dto/chatwoot.dto';
+import { postgresClient } from '../libs/postgres.client';
 import { chatwootImport } from '../utils/chatwoot-import-helper';
+
+interface ChatwootMessage {
+  messageId?: number;
+  inboxId?: number;
+  conversationId?: number;
+  contactInboxSourceId?: string;
+  isRead?: boolean;
+}
 
 export class ChatwootService {
   private readonly logger = new Logger(ChatwootService.name);
@@ -37,17 +47,20 @@ export class ChatwootService {
   constructor(
     private readonly waMonitor: WAMonitoringService,
     private readonly configService: ConfigService,
-    private readonly repository: RepositoryBroker,
+    private readonly prismaRepository: PrismaRepository,
     private readonly cache: ICache,
   ) {}
+
+  private pgClient = postgresClient.getChatwootConnection();
 
   private async getProvider(instance: InstanceDto) {
     const cacheKey = `${instance.instanceName}:getProvider`;
     if (await this.cache.has(cacheKey)) {
-      return (await this.cache.get(cacheKey)) as ChatwootRaw;
+      const provider = (await this.cache.get(cacheKey)) as ChatwootModel;
+
+      return provider;
     }
 
-    this.logger.verbose('get provider to instance: ' + instance.instanceName);
     const provider = await this.waMonitor.waInstances[instance.instanceName]?.findChatwoot();
 
     if (!provider) {
@@ -55,16 +68,12 @@ export class ChatwootService {
       return null;
     }
 
-    this.logger.verbose('provider found');
-
     this.cache.set(cacheKey, provider);
 
     return provider;
   }
 
   private async clientCw(instance: InstanceDto) {
-    this.logger.verbose('get client to instance: ' + instance.instanceName);
-
     const provider = await this.getProvider(instance);
 
     if (!provider) {
@@ -72,28 +81,23 @@ export class ChatwootService {
       return null;
     }
 
-    this.logger.verbose('provider found');
-
     this.provider = provider;
 
-    this.logger.verbose('create client to instance: ' + instance.instanceName);
     const client = new ChatwootClient({
       config: this.getClientCwConfig(),
     });
 
-    this.logger.verbose('client created');
-
     return client;
   }
 
-  public getClientCwConfig(): ChatwootAPIConfig & { name_inbox: string; merge_brazil_contacts: boolean } {
+  public getClientCwConfig(): ChatwootAPIConfig & { nameInbox: string; mergeBrazilContacts: boolean } {
     return {
       basePath: this.provider.url,
       with_credentials: true,
       credentials: 'include',
       token: this.provider.token,
-      name_inbox: this.provider.name_inbox,
-      merge_brazil_contacts: this.provider.merge_brazil_contacts,
+      nameInbox: this.provider.nameInbox,
+      mergeBrazilContacts: this.provider.mergeBrazilContacts,
     };
   }
 
@@ -102,28 +106,26 @@ export class ChatwootService {
   }
 
   public async create(instance: InstanceDto, data: ChatwootDto) {
-    this.logger.verbose('create chatwoot: ' + instance.instanceName);
-
     await this.waMonitor.waInstances[instance.instanceName].setChatwoot(data);
 
-    this.logger.verbose('chatwoot created');
-
-    if (data.auto_create) {
+    if (data.autoCreate) {
+      this.logger.log('Auto create chatwoot instance');
       const urlServer = this.configService.get<HttpServer>('SERVER').URL;
 
       await this.initInstanceChatwoot(
         instance,
-        data.name_inbox ?? instance.instanceName.split('-cwId-')[0],
+        data.nameInbox ?? instance.instanceName.split('-cwId-')[0],
         `${urlServer}/chatwoot/webhook/${encodeURIComponent(instance.instanceName)}`,
         true,
         data.number,
+        data.organization,
+        data.logo,
       );
     }
     return data;
   }
 
   public async find(instance: InstanceDto): Promise<ChatwootDto> {
-    this.logger.verbose('find chatwoot: ' + instance.instanceName);
     try {
       return await this.waMonitor.waInstances[instance.instanceName].findChatwoot();
     } catch (error) {
@@ -133,7 +135,6 @@ export class ChatwootService {
   }
 
   public async getContact(instance: InstanceDto, id: number) {
-    this.logger.verbose('get contact to instance: ' + instance.instanceName);
     const client = await this.clientCw(instance);
 
     if (!client) {
@@ -146,9 +147,8 @@ export class ChatwootService {
       return null;
     }
 
-    this.logger.verbose('find contact in chatwoot');
     const contact = await client.contact.getContactable({
-      accountId: this.provider.account_id,
+      accountId: this.provider.accountId,
       id,
     });
 
@@ -157,7 +157,6 @@ export class ChatwootService {
       return null;
     }
 
-    this.logger.verbose('contact found');
     return contact;
   }
 
@@ -167,9 +166,9 @@ export class ChatwootService {
     webhookUrl: string,
     qrcode: boolean,
     number: string,
+    organization?: string,
+    logo?: string,
   ) {
-    this.logger.verbose('init instance chatwoot: ' + instance.instanceName);
-
     const client = await this.clientCw(instance);
 
     if (!client) {
@@ -177,25 +176,23 @@ export class ChatwootService {
       return null;
     }
 
-    this.logger.verbose('find inbox in chatwoot');
     const findInbox: any = await client.inboxes.list({
-      accountId: this.provider.account_id,
+      accountId: this.provider.accountId,
     });
 
-    this.logger.verbose('check duplicate inbox');
     const checkDuplicate = findInbox.payload.map((inbox) => inbox.name).includes(inboxName);
 
     let inboxId: number;
 
+    this.logger.log('Creating chatwoot inbox');
     if (!checkDuplicate) {
-      this.logger.verbose('create inbox in chatwoot');
       const data = {
         type: 'api',
         webhook_url: webhookUrl,
       };
 
       const inbox = await client.inboxes.create({
-        accountId: this.provider.account_id,
+        accountId: this.provider.accountId,
         data: {
           name: inboxName,
           channel: data as any,
@@ -209,7 +206,6 @@ export class ChatwootService {
 
       inboxId = inbox.id;
     } else {
-      this.logger.verbose('find inbox in chatwoot');
       const inbox = findInbox.payload.find((inbox) => inbox.name === inboxName);
 
       if (!inbox) {
@@ -219,8 +215,9 @@ export class ChatwootService {
 
       inboxId = inbox.id;
     }
+    this.logger.log(`Inox created - inboxId: ${inboxId}`);
 
-    this.logger.verbose('find contact in chatwoot and create if not exists');
+    this.logger.log('Creating chatwoot bot contact');
     const contact =
       (await this.findContact(instance, '123456')) ||
       ((await this.createContact(
@@ -228,8 +225,8 @@ export class ChatwootService {
         '123456',
         inboxId,
         false,
-        'EvolutionAPI',
-        'https://evolution-api.com/files/evolution-api-favicon.png',
+        organization ? organization : 'EvolutionAPI',
+        logo ? logo : 'https://evolution-api.com/files/evolution-api-favicon.png',
       )) as any);
 
     if (!contact) {
@@ -238,16 +235,17 @@ export class ChatwootService {
     }
 
     const contactId = contact.id || contact.payload.contact.id;
+    this.logger.log(`Contact created - contactId: ${contactId}`);
 
     if (qrcode) {
-      this.logger.verbose('create conversation in chatwoot');
+      this.logger.log('QR code enabled');
       const data = {
         contact_id: contactId.toString(),
         inbox_id: inboxId.toString(),
       };
 
       const conversation = await client.conversations.create({
-        accountId: this.provider.account_id,
+        accountId: this.provider.accountId,
         data,
       });
 
@@ -256,8 +254,6 @@ export class ChatwootService {
         return null;
       }
 
-      this.logger.verbose('create message for init instance in chatwoot');
-
       let contentMsg = 'init';
 
       if (number) {
@@ -265,7 +261,7 @@ export class ChatwootService {
       }
 
       const message = await client.messages.create({
-        accountId: this.provider.account_id,
+        accountId: this.provider.accountId,
         conversationId: conversation.id,
         data: {
           content: contentMsg,
@@ -277,9 +273,9 @@ export class ChatwootService {
         this.logger.warn('conversation not found');
         return null;
       }
+      this.logger.log('Init message sent');
     }
 
-    this.logger.verbose('instance chatwoot initialized');
     return true;
   }
 
@@ -292,8 +288,6 @@ export class ChatwootService {
     avatar_url?: string,
     jid?: string,
   ) {
-    this.logger.verbose('create contact to instance: ' + instance.instanceName);
-
     const client = await this.clientCw(instance);
 
     if (!client) {
@@ -303,7 +297,6 @@ export class ChatwootService {
 
     let data: any = {};
     if (!isGroup) {
-      this.logger.verbose('create contact in chatwoot');
       data = {
         inbox_id: inboxId,
         name: name || phoneNumber,
@@ -312,7 +305,6 @@ export class ChatwootService {
         avatar_url: avatar_url,
       };
     } else {
-      this.logger.verbose('create contact group in chatwoot');
       data = {
         inbox_id: inboxId,
         name: name || phoneNumber,
@@ -321,9 +313,8 @@ export class ChatwootService {
       };
     }
 
-    this.logger.verbose('create contact in chatwoot');
     const contact = await client.contacts.create({
-      accountId: this.provider.account_id,
+      accountId: this.provider.accountId,
       data,
     });
 
@@ -332,12 +323,16 @@ export class ChatwootService {
       return null;
     }
 
-    this.logger.verbose('contact created');
+    const findContact = await this.findContact(instance, phoneNumber);
+
+    const contactId = findContact?.id;
+
+    await this.addLabelToContact(this.provider.nameInbox, contactId);
+
     return contact;
   }
 
   public async updateContact(instance: InstanceDto, id: number, data: any) {
-    this.logger.verbose('update contact to instance: ' + instance.instanceName);
     const client = await this.clientCw(instance);
 
     if (!client) {
@@ -350,24 +345,47 @@ export class ChatwootService {
       return null;
     }
 
-    this.logger.verbose('update contact in chatwoot');
     try {
       const contact = await client.contacts.update({
-        accountId: this.provider.account_id,
+        accountId: this.provider.accountId,
         id,
         data,
       });
 
-      this.logger.verbose('contact updated');
       return contact;
     } catch (error) {
       this.logger.error(error);
     }
   }
 
-  public async findContact(instance: InstanceDto, phoneNumber: string) {
-    this.logger.verbose('find contact to instance: ' + instance.instanceName);
+  public async addLabelToContact(nameInbox: string, contactId: number) {
+    try {
+      const sqlTags = `SELECT id FROM tags WHERE name = '${nameInbox}' LIMIT 1`;
 
+      const tagData = (await this.pgClient.query(sqlTags))?.rows[0];
+      let tagId = tagData?.id;
+      const taggingsCount = tagData?.taggings_count || 0;
+
+      const sqlTag = `INSERT INTO tags (name, taggings_count) VALUES ('${nameInbox}', ${
+        taggingsCount + 1
+      }) ON CONFLICT (name) DO UPDATE SET taggings_count = ${taggingsCount + 1} RETURNING id`;
+
+      tagId = (await this.pgClient.query(sqlTag))?.rows[0]?.id;
+
+      await this.pgClient.query(sqlTag);
+
+      const sqlInsertLabel = `INSERT INTO taggings (tag_id, taggable_type, taggable_id, context, created_at) VALUES (${tagId}, 'Contact', ${contactId}, 'labels', NOW())`;
+
+      await this.pgClient.query(sqlInsertLabel);
+
+      return true;
+    } catch (error) {
+      this.logger.error(error);
+      return false;
+    }
+  }
+
+  public async findContact(instance: InstanceDto, phoneNumber: string) {
     const client = await this.clientCw(instance);
 
     if (!client) {
@@ -379,26 +397,22 @@ export class ChatwootService {
     const isGroup = phoneNumber.includes('@g.us');
 
     if (!isGroup) {
-      this.logger.verbose('format phone number');
       query = `+${phoneNumber}`;
     } else {
-      this.logger.verbose('format group id');
       query = phoneNumber;
     }
 
-    this.logger.verbose('find contact in chatwoot');
     let contact: any;
 
     if (isGroup) {
       contact = await client.contacts.search({
-        accountId: this.provider.account_id,
+        accountId: this.provider.accountId,
         q: query,
       });
     } else {
-      // hotfix for: https://github.com/EvolutionAPI/evolution-api/pull/382. waiting fix: https://github.com/figurolatam/chatwoot-sdk/pull/7
       contact = await chatwootRequest(this.getClientCwConfig(), {
         method: 'POST',
-        url: `/api/v1/accounts/${this.provider.account_id}/contacts/filter`,
+        url: `/api/v1/accounts/${this.provider.accountId}/contacts/filter`,
         body: {
           payload: this.getFilterPayload(query),
         },
@@ -411,21 +425,17 @@ export class ChatwootService {
     }
 
     if (!isGroup) {
-      this.logger.verbose('return contact');
       return contact.payload.length > 1 ? this.findContactInContactList(contact.payload, query) : contact.payload[0];
     } else {
-      this.logger.verbose('return group');
       return contact.payload.find((contact) => contact.identifier === query);
     }
   }
 
   private async mergeBrazilianContacts(contacts: any[]) {
     try {
-      //sdk chatwoot não tem função merge
-      this.logger.verbose('merging contacts');
       const contact = await chatwootRequest(this.getClientCwConfig(), {
         method: 'POST',
-        url: `/api/v1/accounts/${this.provider.account_id}/actions/contact_merge`,
+        url: `/api/v1/accounts/${this.provider.accountId}/actions/contact_merge`,
         body: {
           base_contact_id: contacts.find((contact) => contact.phone_number.length === 14)?.id,
           mergee_contact_id: contacts.find((contact) => contact.phone_number.length === 13)?.id,
@@ -444,8 +454,7 @@ export class ChatwootService {
     const searchableFields = this.getSearchableFields();
 
     // eslint-disable-next-line prettier/prettier
-    if(contacts.length === 2 && this.getClientCwConfig().merge_brazil_contacts && query.startsWith('+55')){
-
+    if (contacts.length === 2 && this.getClientCwConfig().mergeBrazilContacts && query.startsWith('+55')) {
       const contact = this.mergeBrazilianContacts(contacts);
       if (contact) {
         return contact;
@@ -514,7 +523,6 @@ export class ChatwootService {
   }
 
   public async createConversation(instance: InstanceDto, body: any) {
-    this.logger.verbose('create conversation to instance: ' + instance.instanceName);
     try {
       const client = await this.clientCw(instance);
 
@@ -529,7 +537,7 @@ export class ChatwootService {
         let conversationExists: conversation | boolean;
         try {
           conversationExists = await client.conversations.get({
-            accountId: this.provider.account_id,
+            accountId: this.provider.accountId,
             conversationId: conversationId,
           });
         } catch (error) {
@@ -545,17 +553,12 @@ export class ChatwootService {
 
       const isGroup = body.key.remoteJid.includes('@g.us');
 
-      this.logger.verbose('is group: ' + isGroup);
-
       const chatId = isGroup ? body.key.remoteJid : body.key.remoteJid.split('@')[0];
-
-      this.logger.verbose('chat id: ' + chatId);
 
       let nameContact: string;
 
       nameContact = !body.key.fromMe ? body.pushName : chatId;
 
-      this.logger.verbose('get inbox to instance: ' + instance.instanceName);
       const filterInbox = await this.getInbox(instance);
 
       if (!filterInbox) {
@@ -564,12 +567,9 @@ export class ChatwootService {
       }
 
       if (isGroup) {
-        this.logger.verbose('get group name');
         const group = await this.waMonitor.waInstances[instance.instanceName].client.groupMetadata(chatId);
 
         nameContact = `${group.subject} (GROUP)`;
-
-        this.logger.verbose('find or create participant in chatwoot');
 
         const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(
           body.key.participant.split('@')[0],
@@ -597,8 +597,6 @@ export class ChatwootService {
         }
       }
 
-      this.logger.verbose('find or create contact in chatwoot');
-
       const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(chatId);
 
       let contact = await this.findContact(instance, chatId);
@@ -620,7 +618,6 @@ export class ChatwootService {
 
           const contactNeedsUpdate = pictureNeedsUpdate || nameNeedsUpdate;
           if (contactNeedsUpdate) {
-            this.logger.verbose('update contact in chatwoot');
             contact = await this.updateContact(instance, contact.id, {
               ...(nameNeedsUpdate && { name: nameContact }),
               ...(waProfilePictureFile === '' && { avatar: null }),
@@ -648,20 +645,19 @@ export class ChatwootService {
 
       const contactId = contact?.payload?.id || contact?.payload?.contact?.id || contact?.id;
 
-      this.logger.verbose('get contact conversations in chatwoot');
       const contactConversations = (await client.contacts.listConversations({
-        accountId: this.provider.account_id,
+        accountId: this.provider.accountId,
         id: contactId,
       })) as any;
 
       if (contactConversations?.payload?.length) {
         let conversation: any;
-        if (this.provider.reopen_conversation) {
+        if (this.provider.reopenConversation) {
           conversation = contactConversations.payload.find((conversation) => conversation.inbox_id == filterInbox.id);
 
-          if (this.provider.conversation_pending) {
+          if (this.provider.conversationPending) {
             await client.conversations.toggleStatus({
-              accountId: this.provider.account_id,
+              accountId: this.provider.accountId,
               conversationId: conversation.id,
               data: {
                 status: 'pending',
@@ -673,27 +669,24 @@ export class ChatwootService {
             (conversation) => conversation.status !== 'resolved' && conversation.inbox_id == filterInbox.id,
           );
         }
-        this.logger.verbose('return conversation if exists');
 
         if (conversation) {
-          this.logger.verbose('conversation found');
           this.cache.set(cacheKey, conversation.id);
           return conversation.id;
         }
       }
 
-      this.logger.verbose('create conversation in chatwoot');
       const data = {
         contact_id: contactId.toString(),
         inbox_id: filterInbox.id.toString(),
       };
 
-      if (this.provider.conversation_pending) {
+      if (this.provider.conversationPending) {
         data['status'] = 'pending';
       }
 
       const conversation = await client.conversations.create({
-        accountId: this.provider.account_id,
+        accountId: this.provider.accountId,
         data,
       });
 
@@ -702,7 +695,6 @@ export class ChatwootService {
         return null;
       }
 
-      this.logger.verbose('conversation created');
       this.cache.set(cacheKey, conversation.id);
       return conversation.id;
     } catch (error) {
@@ -711,8 +703,6 @@ export class ChatwootService {
   }
 
   public async getInbox(instance: InstanceDto) {
-    this.logger.verbose('get inbox to instance: ' + instance.instanceName);
-
     const cacheKey = `${instance.instanceName}:getInbox`;
     if (await this.cache.has(cacheKey)) {
       return (await this.cache.get(cacheKey)) as inbox;
@@ -725,9 +715,8 @@ export class ChatwootService {
       return null;
     }
 
-    this.logger.verbose('find inboxes in chatwoot');
     const inbox = (await client.inboxes.list({
-      accountId: this.provider.account_id,
+      accountId: this.provider.accountId,
     })) as any;
 
     if (!inbox) {
@@ -735,15 +724,13 @@ export class ChatwootService {
       return null;
     }
 
-    this.logger.verbose('find inbox by name');
-    const findByName = inbox.payload.find((inbox) => inbox.name === this.getClientCwConfig().name_inbox);
+    const findByName = inbox.payload.find((inbox) => inbox.name === this.getClientCwConfig().nameInbox);
 
     if (!findByName) {
       this.logger.warn('inbox not found');
       return null;
     }
 
-    this.logger.verbose('return inbox');
     this.cache.set(cacheKey, findByName);
     return findByName;
   }
@@ -761,9 +748,8 @@ export class ChatwootService {
     }[],
     messageBody?: any,
     sourceId?: string,
+    quotedMsg?: MessageModel,
   ) {
-    this.logger.verbose('create message to instance: ' + instance.instanceName);
-
     const client = await this.clientCw(instance);
 
     if (!client) {
@@ -773,9 +759,10 @@ export class ChatwootService {
 
     const replyToIds = await this.getReplyToIds(messageBody, instance);
 
-    this.logger.verbose('create message in chatwoot');
+    const sourceReplyId = quotedMsg?.chatwootMessageId || null;
+
     const message = await client.messages.create({
-      accountId: this.provider.account_id,
+      accountId: this.provider.accountId,
       conversationId: conversationId,
       data: {
         content: content,
@@ -786,6 +773,7 @@ export class ChatwootService {
         content_attributes: {
           ...replyToIds,
         },
+        source_reply_id: sourceReplyId ? sourceReplyId.toString() : null,
       },
     });
 
@@ -793,8 +781,6 @@ export class ChatwootService {
       this.logger.warn('message not found');
       return null;
     }
-
-    this.logger.verbose('message created');
 
     return message;
   }
@@ -804,8 +790,6 @@ export class ChatwootService {
     inbox: inbox,
     contact: generic_id & contact,
   ): Promise<conversation> {
-    this.logger.verbose('find conversation in chatwoot');
-
     const client = await this.clientCw(instance);
 
     if (!client) {
@@ -814,7 +798,7 @@ export class ChatwootService {
     }
 
     const conversations = (await client.contacts.listConversations({
-      accountId: this.provider.account_id,
+      accountId: this.provider.accountId,
       id: contact.id,
     })) as any;
 
@@ -835,8 +819,6 @@ export class ChatwootService {
       filename: string;
     }[],
   ) {
-    this.logger.verbose('create bot message to instance: ' + instance.instanceName);
-
     const client = await this.clientCw(instance);
 
     if (!client) {
@@ -844,7 +826,6 @@ export class ChatwootService {
       return null;
     }
 
-    this.logger.verbose('find contact in chatwoot');
     const contact = await this.findContact(instance, '123456');
 
     if (!contact) {
@@ -852,7 +833,6 @@ export class ChatwootService {
       return null;
     }
 
-    this.logger.verbose('get inbox to instance: ' + instance.instanceName);
     const filterInbox = await this.getInbox(instance);
 
     if (!filterInbox) {
@@ -867,9 +847,8 @@ export class ChatwootService {
       return;
     }
 
-    this.logger.verbose('create message in chatwoot');
     const message = await client.messages.create({
-      accountId: this.provider.account_id,
+      accountId: this.provider.accountId,
       conversationId: conversation.id,
       data: {
         content: content,
@@ -883,8 +862,6 @@ export class ChatwootService {
       return null;
     }
 
-    this.logger.verbose('bot message created');
-
     return message;
   }
 
@@ -896,21 +873,19 @@ export class ChatwootService {
     instance?: InstanceDto,
     messageBody?: any,
     sourceId?: string,
+    quotedMsg?: MessageModel,
   ) {
-    this.logger.verbose('send data to chatwoot');
-
     const data = new FormData();
 
     if (content) {
-      this.logger.verbose('content found');
       data.append('content', content);
     }
 
-    this.logger.verbose('message type: ' + messageType);
     data.append('message_type', messageType);
 
-    this.logger.verbose('temp file found');
     data.append('attachments[]', createReadStream(file));
+
+    const sourceReplyId = quotedMsg?.chatwootMessageId || null;
 
     if (messageBody && instance) {
       const replyToIds = await this.getReplyToIds(messageBody, instance);
@@ -922,15 +897,18 @@ export class ChatwootService {
       }
     }
 
+    if (sourceReplyId) {
+      data.append('source_reply_id', sourceReplyId.toString());
+    }
+
     if (sourceId) {
       data.append('source_id', sourceId);
     }
 
-    this.logger.verbose('get client to instance: ' + this.provider.instanceName);
     const config = {
       method: 'post',
       maxBodyLength: Infinity,
-      url: `${this.provider.url}/api/v1/accounts/${this.provider.account_id}/conversations/${conversationId}/messages`,
+      url: `${this.provider.url}/api/v1/accounts/${this.provider.accountId}/conversations/${conversationId}/messages`,
       headers: {
         api_access_token: this.provider.token,
         ...data.getHeaders(),
@@ -938,14 +916,11 @@ export class ChatwootService {
       data: data,
     };
 
-    this.logger.verbose('send data to chatwoot');
     try {
       const { data } = await axios.request(config);
 
-      this.logger.verbose('remove temp file');
       unlinkSync(file);
 
-      this.logger.verbose('data sent');
       return data;
     } catch (error) {
       this.logger.error(error);
@@ -959,7 +934,6 @@ export class ChatwootService {
     messageType: 'incoming' | 'outgoing' | undefined,
     file?: string,
   ) {
-    this.logger.verbose('create bot qr to instance: ' + instance.instanceName);
     const client = await this.clientCw(instance);
 
     if (!client) {
@@ -967,7 +941,6 @@ export class ChatwootService {
       return null;
     }
 
-    this.logger.verbose('find contact in chatwoot');
     const contact = await this.findContact(instance, '123456');
 
     if (!contact) {
@@ -975,7 +948,6 @@ export class ChatwootService {
       return null;
     }
 
-    this.logger.verbose('get inbox to instance: ' + instance.instanceName);
     const filterInbox = await this.getInbox(instance);
 
     if (!filterInbox) {
@@ -990,27 +962,22 @@ export class ChatwootService {
       return;
     }
 
-    this.logger.verbose('send data to chatwoot');
     const data = new FormData();
 
     if (content) {
-      this.logger.verbose('content found');
       data.append('content', content);
     }
 
-    this.logger.verbose('message type: ' + messageType);
     data.append('message_type', messageType);
 
     if (file) {
-      this.logger.verbose('temp file found');
       data.append('attachments[]', createReadStream(file));
     }
 
-    this.logger.verbose('get client to instance: ' + this.provider.instanceName);
     const config = {
       method: 'post',
       maxBodyLength: Infinity,
-      url: `${this.provider.url}/api/v1/accounts/${this.provider.account_id}/conversations/${conversation.id}/messages`,
+      url: `${this.provider.url}/api/v1/accounts/${this.provider.accountId}/conversations/${conversation.id}/messages`,
       headers: {
         api_access_token: this.provider.token,
         ...data.getHeaders(),
@@ -1018,14 +985,11 @@ export class ChatwootService {
       data: data,
     };
 
-    this.logger.verbose('send data to chatwoot');
     try {
       const { data } = await axios.request(config);
 
-      this.logger.verbose('remove temp file');
       unlinkSync(file);
 
-      this.logger.verbose('data sent');
       return data;
     } catch (error) {
       this.logger.error(error);
@@ -1033,10 +997,7 @@ export class ChatwootService {
   }
 
   public async sendAttachment(waInstance: any, number: string, media: any, caption?: string, options?: Options) {
-    this.logger.verbose('send attachment to instance: ' + waInstance.instanceName);
-
     try {
-      this.logger.verbose('get media type');
       const parsedMedia = path.parse(decodeURIComponent(media));
       let mimeType = mimeTypes.lookup(parsedMedia?.ext) || '';
       let fileName = parsedMedia?.name + parsedMedia?.ext;
@@ -1044,13 +1005,11 @@ export class ChatwootService {
       if (!mimeType) {
         const parts = media.split('/');
         fileName = decodeURIComponent(parts[parts.length - 1]);
-        this.logger.verbose('file name: ' + fileName);
 
         const response = await axios.get(media, {
           responseType: 'arraybuffer',
         });
         mimeType = response.headers['content-type'];
-        this.logger.verbose('mime type: ' + mimeType);
       }
 
       let type = 'document';
@@ -1070,25 +1029,16 @@ export class ChatwootService {
           break;
       }
 
-      this.logger.verbose('type: ' + type);
-
       if (type === 'audio') {
-        this.logger.verbose('send audio to instance: ' + waInstance.instanceName);
         const data: SendAudioDto = {
           number: number,
-          audioMessage: {
-            audio: media,
-          },
-          options: {
-            delay: 1200,
-            presence: 'recording',
-            ...options,
-          },
+          audio: media,
+          delay: 1200,
+          quoted: options?.quoted,
         };
 
         const messageSent = await waInstance?.audioWhatsapp(data, true);
 
-        this.logger.verbose('audio sent');
         return messageSent;
       }
 
@@ -1096,29 +1046,21 @@ export class ChatwootService {
         type = 'document';
       }
 
-      this.logger.verbose('send media to instance: ' + waInstance.instanceName);
       const data: SendMediaDto = {
         number: number,
-        mediaMessage: {
-          mediatype: type as any,
-          fileName: fileName,
-          media: media,
-        },
-        options: {
-          delay: 1200,
-          presence: 'composing',
-          ...options,
-        },
+        mediatype: type as any,
+        fileName: fileName,
+        media: media,
+        delay: 1200,
+        quoted: options?.quoted,
       };
 
       if (caption) {
-        this.logger.verbose('caption found');
-        data.mediaMessage.caption = caption;
+        data.caption = caption;
       }
 
       const messageSent = await waInstance?.mediaMessage(data, true);
 
-      this.logger.verbose('media sent');
       return messageSent;
     } catch (error) {
       this.logger.error(error);
@@ -1133,7 +1075,7 @@ export class ChatwootService {
     }
 
     client.messages.create({
-      accountId: this.provider.account_id,
+      accountId: this.provider.accountId,
       conversationId: conversation,
       data: {
         content: i18next.t('cw.message.notsent', {
@@ -1149,7 +1091,6 @@ export class ChatwootService {
     try {
       await new Promise((resolve) => setTimeout(resolve, 500));
 
-      this.logger.verbose('receive webhook to chatwoot instance: ' + instance.instanceName);
       const client = await this.clientCw(instance);
 
       if (!client) {
@@ -1157,9 +1098,8 @@ export class ChatwootService {
         return null;
       }
 
-      // invalidate the conversation cache if reopen_conversation is false and the conversation was resolved
       if (
-        this.provider.reopen_conversation === false &&
+        this.provider.reopenConversation === false &&
         body.event === 'conversation_status_changed' &&
         body.status === 'resolved' &&
         body.meta?.sender?.identifier
@@ -1168,7 +1108,6 @@ export class ChatwootService {
         this.cache.delete(keyToDelete);
       }
 
-      this.logger.verbose('check if is bot');
       if (
         !body?.conversation ||
         body.private ||
@@ -1177,7 +1116,6 @@ export class ChatwootService {
         return { message: 'bot' };
       }
 
-      this.logger.verbose('check if is group');
       const chatId =
         body.conversation.meta.sender?.phone_number?.replace('+', '') || body.conversation.meta.sender?.identifier;
       // Chatwoot to Whatsapp
@@ -1192,28 +1130,28 @@ export class ChatwootService {
       const senderName = body?.conversation?.messages[0]?.sender?.available_name || body?.sender?.name;
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
 
-      this.logger.verbose('check if is a message deletion');
       if (body.event === 'message_updated' && body.content_attributes?.deleted) {
-        const message = await this.repository.message.find({
+        const message = await this.prismaRepository.message.findFirst({
           where: {
-            owner: instance.instanceName,
-            chatwoot: {
-              messageId: body.id,
-            },
+            chatwootMessageId: body.id,
+            instanceId: instance.instanceId,
           },
-          limit: 1,
         });
-        if (message.length && message[0].key?.id) {
-          this.logger.verbose('deleting message in whatsapp. Message id: ' + message[0].key.id);
-          await waInstance?.client.sendMessage(message[0].key.remoteJid, { delete: message[0].key });
 
-          this.logger.verbose('deleting message in repository. Message id: ' + message[0].key.id);
-          this.repository.message.delete({
+        if (message) {
+          const key = message.key as {
+            id: string;
+            remoteJid: string;
+            fromMe: boolean;
+            participant: string;
+          };
+
+          await waInstance?.client.sendMessage(key.remoteJid, { delete: key });
+
+          await this.prismaRepository.message.deleteMany({
             where: {
-              owner: instance.instanceName,
-              chatwoot: {
-                messageId: body.id,
-              },
+              instanceId: instance.instanceId,
+              chatwootMessageId: body.id,
             },
           });
         }
@@ -1221,23 +1159,15 @@ export class ChatwootService {
       }
 
       if (chatId === '123456' && body.message_type === 'outgoing') {
-        this.logger.verbose('check if is command');
-
         const command = messageReceived.replace('/', '');
 
         if (command.includes('init') || command.includes('iniciar')) {
-          this.logger.verbose('command init found');
           const state = waInstance?.connectionStatus?.state;
 
           if (state !== 'open') {
-            if (state === 'close') {
-              this.logger.verbose('request cleaning up instance: ' + instance.instanceName);
-            }
-            this.logger.verbose('connect to whatsapp');
             const number = command.split(':')[1];
             await waInstance.connectToWhatsapp(number);
           } else {
-            this.logger.verbose('whatsapp already connected');
             await this.createBotMessage(
               instance,
               i18next.t('cw.inbox.alreadyConnected', {
@@ -1249,7 +1179,6 @@ export class ChatwootService {
         }
 
         if (command === 'clearcache') {
-          this.logger.verbose('command clearcache found');
           waInstance.clearCacheChatwoot();
           await this.createBotMessage(
             instance,
@@ -1261,12 +1190,9 @@ export class ChatwootService {
         }
 
         if (command === 'status') {
-          this.logger.verbose('command status found');
-
           const state = waInstance?.connectionStatus?.state;
 
           if (!state) {
-            this.logger.verbose('state not found');
             await this.createBotMessage(
               instance,
               i18next.t('cw.inbox.notFound', {
@@ -1277,7 +1203,6 @@ export class ChatwootService {
           }
 
           if (state) {
-            this.logger.verbose('state: ' + state + ' found');
             await this.createBotMessage(
               instance,
               i18next.t('cw.inbox.status', {
@@ -1290,26 +1215,19 @@ export class ChatwootService {
         }
 
         if (command === 'disconnect' || command === 'desconectar') {
-          this.logger.verbose('command disconnect found');
-
           const msgLogout = i18next.t('cw.inbox.disconnect', {
             inboxName: body.inbox.name,
           });
 
-          this.logger.verbose('send message to chatwoot');
           await this.createBotMessage(instance, msgLogout, 'incoming');
 
-          this.logger.verbose('disconnect to whatsapp');
           await waInstance?.client?.logout('Log out instance: ' + instance.instanceName);
           await waInstance?.client?.ws?.close();
         }
       }
 
       if (body.message_type === 'outgoing' && body?.conversation?.messages?.length && chatId !== '123456') {
-        this.logger.verbose('check if is group');
-
         if (body?.conversation?.messages[0]?.source_id?.substring(0, 5) === 'WAID:') {
-          this.logger.verbose('message sent directly from whatsapp. Webhook ignored.');
           return { message: 'bot' };
         }
 
@@ -1318,28 +1236,23 @@ export class ChatwootService {
           return { message: 'bot' };
         }
 
-        this.logger.verbose('Format message to send');
         let formatText: string;
         if (senderName === null || senderName === undefined) {
           formatText = messageReceived;
         } else {
-          const formattedDelimiter = this.provider.sign_delimiter
-            ? this.provider.sign_delimiter.replaceAll('\\n', '\n')
+          const formattedDelimiter = this.provider.signDelimiter
+            ? this.provider.signDelimiter.replaceAll('\\n', '\n')
             : '\n';
-          const textToConcat = this.provider.sign_msg ? [`*${senderName}:*`] : [];
+          const textToConcat = this.provider.signMsg ? [`*${senderName}:*`] : [];
           textToConcat.push(messageReceived);
 
           formatText = textToConcat.join(formattedDelimiter);
         }
 
         for (const message of body.conversation.messages) {
-          this.logger.verbose('check if message is media');
           if (message.attachments && message.attachments.length > 0) {
-            this.logger.verbose('message is media');
             for (const attachment of message.attachments) {
-              this.logger.verbose('send media to whatsapp');
               if (!messageReceived) {
-                this.logger.verbose('message do not have text');
                 formatText = null;
               }
 
@@ -1358,7 +1271,7 @@ export class ChatwootService {
                 this.onSendMessageError(instance, body.conversation?.id);
               }
 
-              this.updateChatwootMessageId(
+              await this.updateChatwootMessageId(
                 {
                   ...messageSent,
                   owner: instance.instanceName,
@@ -1367,48 +1280,40 @@ export class ChatwootService {
                   messageId: body.id,
                   inboxId: body.inbox?.id,
                   conversationId: body.conversation?.id,
-                  contactInbox: {
-                    sourceId: body.conversation?.contact_inbox?.source_id,
-                  },
+                  contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
                 },
                 instance,
               );
             }
           } else {
-            this.logger.verbose('message is text');
-
-            this.logger.verbose('send text to whatsapp');
             const data: SendTextDto = {
               number: chatId,
-              textMessage: {
-                text: formatText,
-              },
-              options: {
-                delay: 1200,
-                presence: 'composing',
-                quoted: await this.getQuotedMessage(body, instance),
-              },
+              text: formatText,
+              delay: 1200,
+              quoted: await this.getQuotedMessage(body, instance),
             };
 
-            let messageSent: MessageRaw | proto.WebMessageInfo;
+            let messageSent: any;
             try {
               messageSent = await waInstance?.textMessage(data, true);
               if (!messageSent) {
                 throw new Error('Message not sent');
               }
 
-              this.updateChatwootMessageId(
+              if (Long.isLong(messageSent?.messageTimestamp)) {
+                messageSent.messageTimestamp = messageSent.messageTimestamp?.toNumber();
+              }
+
+              await this.updateChatwootMessageId(
                 {
                   ...messageSent,
-                  owner: instance.instanceName,
+                  instanceId: instance.instanceId,
                 },
                 {
                   messageId: body.id,
                   inboxId: body.inbox?.id,
                   conversationId: body.conversation?.id,
-                  contactInbox: {
-                    sourceId: body.conversation?.contact_inbox?.source_id,
-                  },
+                  contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
                 },
                 instance,
               );
@@ -1423,51 +1328,60 @@ export class ChatwootService {
 
         const chatwootRead = this.configService.get<Chatwoot>('CHATWOOT').MESSAGE_READ;
         if (chatwootRead) {
-          const lastMessage = await this.repository.message.find({
+          const lastMessage = await this.prismaRepository.message.findFirst({
             where: {
               key: {
-                fromMe: false,
+                path: ['fromMe'],
+                equals: false,
               },
-              owner: instance.instanceName,
+              instanceId: instance.instanceId,
             },
-            limit: 1,
           });
-          if (lastMessage.length > 0 && !lastMessage[0].chatwoot?.isRead) {
+          if (lastMessage && !lastMessage.chatwootIsRead) {
+            const key = lastMessage.key as {
+              id: string;
+              fromMe: boolean;
+              remoteJid: string;
+              participant?: string;
+            };
+
             waInstance?.markMessageAsRead({
-              read_messages: lastMessage.map((msg) => ({
-                id: msg.key?.id,
-                fromMe: msg.key?.fromMe,
-                remoteJid: msg.key?.remoteJid,
-              })),
+              read_messages: [
+                {
+                  id: key.id,
+                  fromMe: key.fromMe,
+                  remoteJid: key.remoteJid,
+                },
+              ],
             });
-            const updateMessage = lastMessage.map((msg) => ({
-              key: msg.key,
-              owner: msg.owner,
-              chatwoot: {
-                ...msg.chatwoot,
-                isRead: true,
+            const updateMessage = {
+              chatwootMessageId: lastMessage.chatwootMessageId,
+              chatwootConversationId: lastMessage.chatwootConversationId,
+              chatwootInboxId: lastMessage.chatwootInboxId,
+              chatwootContactInboxSourceId: lastMessage.chatwootContactInboxSourceId,
+              chatwootIsRead: true,
+            };
+
+            await this.prismaRepository.message.updateMany({
+              where: {
+                instanceId: instance.instanceId,
+                key: {
+                  path: ['id'],
+                  equals: key.id,
+                },
               },
-            }));
-            this.repository.message.update(updateMessage, instance.instanceName, true);
+              data: updateMessage,
+            });
           }
         }
       }
 
       if (body.message_type === 'template' && body.event === 'message_created') {
-        this.logger.verbose('check if is template');
-
         const data: SendTextDto = {
           number: chatId,
-          textMessage: {
-            text: body.content.replace(/\\\r\n|\\\n|\n/g, '\n'),
-          },
-          options: {
-            delay: 1200,
-            presence: 'composing',
-          },
+          text: body.content.replace(/\\\r\n|\\\n|\n/g, '\n'),
+          delay: 1200,
         };
-
-        this.logger.verbose('send text to whatsapp');
 
         await waInstance?.textMessage(data);
       }
@@ -1480,31 +1394,52 @@ export class ChatwootService {
     }
   }
 
-  private updateChatwootMessageId(
-    message: MessageRaw,
-    chatwootMessageIds: MessageRaw['chatwoot'],
+  private async updateChatwootMessageId(
+    message: MessageModel,
+    chatwootMessageIds: ChatwootMessage,
     instance: InstanceDto,
   ) {
-    if (!chatwootMessageIds.messageId || !message?.key?.id) {
+    const key = message.key as {
+      id: string;
+      fromMe: boolean;
+      remoteJid: string;
+      participant?: string;
+    };
+
+    if (!chatwootMessageIds.messageId || !key?.id) {
       return;
     }
 
-    message.chatwoot = chatwootMessageIds;
-    this.repository.message.update([message], instance.instanceName, true);
-  }
-
-  private async getMessageByKeyId(instance: InstanceDto, keyId: string): Promise<MessageRaw> {
-    const messages = await this.repository.message.find({
+    await this.prismaRepository.message.updateMany({
       where: {
         key: {
-          id: keyId,
+          path: ['id'],
+          equals: key.id,
         },
-        owner: instance.instanceName,
+        instanceId: instance.instanceId,
       },
-      limit: 1,
+      data: {
+        chatwootMessageId: chatwootMessageIds.messageId,
+        chatwootConversationId: chatwootMessageIds.conversationId,
+        chatwootInboxId: chatwootMessageIds.inboxId,
+        chatwootContactInboxSourceId: chatwootMessageIds.contactInboxSourceId,
+        chatwootIsRead: chatwootMessageIds.isRead,
+      },
+    });
+  }
+
+  private async getMessageByKeyId(instance: InstanceDto, keyId: string): Promise<MessageModel> {
+    const messages = await this.prismaRepository.message.findFirst({
+      where: {
+        key: {
+          path: ['id'],
+          equals: keyId,
+        },
+        instanceId: instance.instanceId,
+      },
     });
 
-    return messages.length ? messages[0] : null;
+    return messages || null;
   }
 
   private async getReplyToIds(
@@ -1518,8 +1453,8 @@ export class ChatwootService {
       inReplyToExternalId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId;
       if (inReplyToExternalId) {
         const message = await this.getMessageByKeyId(instance, inReplyToExternalId);
-        if (message?.chatwoot?.messageId) {
-          inReplyTo = message.chatwoot.messageId;
+        if (message?.chatwootMessageId) {
+          inReplyTo = message.chatwootMessageId;
         }
       }
     }
@@ -1532,19 +1467,24 @@ export class ChatwootService {
 
   private async getQuotedMessage(msg: any, instance: InstanceDto): Promise<Quoted> {
     if (msg?.content_attributes?.in_reply_to) {
-      const message = await this.repository.message.find({
+      const message = await this.prismaRepository.message.findFirst({
         where: {
-          chatwoot: {
-            messageId: msg?.content_attributes?.in_reply_to,
-          },
-          owner: instance.instanceName,
+          chatwootMessageId: msg?.content_attributes?.in_reply_to,
+          instanceId: instance.instanceId,
         },
-        limit: 1,
       });
-      if (message.length && message[0]?.key?.id) {
+
+      const key = message?.key as {
+        id: string;
+        fromMe: boolean;
+        remoteJid: string;
+        participant?: string;
+      };
+
+      if (message && key?.id) {
         return {
-          key: message[0].key,
-          message: message[0].message,
+          key: message.key as proto.IMessageKey,
+          message: message.message as proto.IMessage,
         };
       }
     }
@@ -1553,7 +1493,6 @@ export class ChatwootService {
   }
 
   private isMediaMessage(message: any) {
-    this.logger.verbose('check if is media message');
     const media = [
       'imageMessage',
       'documentMessage',
@@ -1567,7 +1506,6 @@ export class ChatwootService {
 
     const result = messageKeys.some((key) => media.includes(key));
 
-    this.logger.verbose('is media message: ' + result);
     return result;
   }
 
@@ -1580,26 +1518,25 @@ export class ChatwootService {
     }
     const adsMessage: AdsMessage | undefined = msg.extendedTextMessage?.contextInfo?.externalAdReply;
 
-    this.logger.verbose('Get ads message if it exist');
-    adsMessage && this.logger.verbose('Ads message: ' + adsMessage);
     return adsMessage;
   }
 
   private getReactionMessage(msg: any) {
     interface ReactionMessage {
-      key: MessageRaw['key'];
+      key: {
+        id: string;
+        fromMe: boolean;
+        remoteJid: string;
+        participant?: string;
+      };
       text: string;
     }
     const reactionMessage: ReactionMessage | undefined = msg?.reactionMessage;
 
-    this.logger.verbose('Get reaction message if it exists');
-    reactionMessage && this.logger.verbose('Reaction message: ' + reactionMessage);
     return reactionMessage;
   }
 
   private getTypeMessage(msg: any) {
-    this.logger.verbose('get type message');
-
     const types = {
       conversation: msg.conversation,
       imageMessage: msg.imageMessage?.caption,
@@ -1618,13 +1555,10 @@ export class ChatwootService {
       listResponseMessage: msg.listResponseMessage,
     };
 
-    this.logger.verbose('type message: ' + types);
-
     return types;
   }
 
   private getMessageContent(types: any) {
-    this.logger.verbose('get message content');
     const typeKey = Object.keys(types).find((key) => types[key] !== undefined);
 
     const result = typeKey ? types[typeKey] : undefined;
@@ -1644,8 +1578,6 @@ export class ChatwootService {
         (locationAddress ? `_${i18next.t('cw.locationMessage.locationAddress')}:_ ${locationAddress} \n` : '') +
         `_${i18next.t('cw.locationMessage.locationUrl')}:_ ` +
         `https://www.google.com/maps/search/?api=1&query=${latitude},${longitude}`;
-
-      this.logger.verbose('message content: ' + formattedLocation);
 
       return formattedLocation;
     }
@@ -1678,7 +1610,6 @@ export class ChatwootService {
         }
       });
 
-      this.logger.verbose('message content: ' + formattedContact);
       return formattedContact;
     }
 
@@ -1715,8 +1646,6 @@ export class ChatwootService {
       });
 
       const formattedContactsArray = formattedContacts.join('\n\n');
-
-      this.logger.verbose('formatted contacts: ' + formattedContactsArray);
 
       return formattedContactsArray;
     }
@@ -1777,25 +1706,18 @@ export class ChatwootService {
       return formattedResponseList;
     }
 
-    this.logger.verbose('message content: ' + result);
-
     return result;
   }
 
   public getConversationMessage(msg: any) {
-    this.logger.verbose('get conversation message');
-
     const types = this.getTypeMessage(msg);
 
     const messageContent = this.getMessageContent(types);
-
-    this.logger.verbose('conversation message: ' + messageContent);
 
     return messageContent;
   }
 
   public async eventWhatsapp(event: string, instance: InstanceDto, body: any) {
-    this.logger.verbose('event whatsapp to instance: ' + instance.instanceName);
     try {
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
 
@@ -1820,7 +1742,7 @@ export class ChatwootService {
         }
 
         client.messages.create({
-          accountId: this.provider.account_id,
+          accountId: this.provider.accountId,
           conversationId: getConversation,
           data: {
             content: `🚨 ${i18next.t('numbernotinwhatsapp')}`,
@@ -1833,10 +1755,7 @@ export class ChatwootService {
       }
 
       if (event === 'messages.upsert' || event === 'send.message') {
-        this.logger.verbose('event messages.upsert');
-
         if (body.key.remoteJid === 'status@broadcast') {
-          this.logger.verbose('status broadcast found');
           return;
         }
 
@@ -1847,8 +1766,6 @@ export class ChatwootService {
           };
         }
 
-        this.logger.verbose('get conversation message');
-
         // Whatsapp to Chatwoot
         const originalMessage = await this.getConversationMessage(body.message);
         const bodyMessage = originalMessage
@@ -1858,12 +1775,23 @@ export class ChatwootService {
               .replaceAll(/~((?!\s)([^\n~]+?)(?<!\s))~/g, '~~$1~~')
           : originalMessage;
 
-        this.logger.verbose('body message: ' + bodyMessage);
-
         if (bodyMessage && bodyMessage.includes('Por favor, classifique esta conversa, http')) {
-          this.logger.verbose('conversation is closed');
           return;
         }
+
+        const quotedId = body.contextInfo?.stanzaId || body.message?.contextInfo?.stanzaId;
+
+        let quotedMsg = null;
+
+        if (quotedId)
+          quotedMsg = await this.prismaRepository.message.findFirst({
+            where: {
+              key: {
+                path: ['id'],
+                equals: quotedId,
+              },
+            },
+          });
 
         const isMedia = this.isMediaMessage(body.message);
 
@@ -1876,7 +1804,6 @@ export class ChatwootService {
           return;
         }
 
-        this.logger.verbose('get conversation in chatwoot');
         const getConversation = await this.createConversation(instance, body);
 
         if (!getConversation) {
@@ -1886,15 +1813,7 @@ export class ChatwootService {
 
         const messageType = body.key.fromMe ? 'outgoing' : 'incoming';
 
-        this.logger.verbose('message type: ' + messageType);
-
-        this.logger.verbose('is media: ' + isMedia);
-
-        this.logger.verbose('check if is media');
         if (isMedia) {
-          this.logger.verbose('message is media');
-
-          this.logger.verbose('get base64 from media message');
           const downloadBase64 = await waInstance?.getBase64FromMediaMessage({
             message: {
               ...body,
@@ -1921,28 +1840,19 @@ export class ChatwootService {
 
           const fileName = `${path.join(waInstance?.storePath, 'temp', `${nameFile}`)}`;
 
-          this.logger.verbose('temp file name: ' + nameFile);
-
-          this.logger.verbose('create temp file');
           writeFileSync(fileName, fileData, 'utf8');
 
-          this.logger.verbose('check if is group');
           if (body.key.remoteJid.includes('@g.us')) {
-            this.logger.verbose('message is group');
-
             const participantName = body.pushName;
 
             let content: string;
 
             if (!body.key.fromMe) {
-              this.logger.verbose('message is not from me');
               content = `**${participantName}:**\n\n${bodyMessage}`;
             } else {
-              this.logger.verbose('message is from me');
               content = `${bodyMessage}`;
             }
 
-            this.logger.verbose('send data to chatwoot');
             const send = await this.sendData(
               getConversation,
               fileName,
@@ -1951,6 +1861,7 @@ export class ChatwootService {
               instance,
               body,
               'WAID:' + body.key.id,
+              quotedMsg,
             );
 
             if (!send) {
@@ -1960,9 +1871,6 @@ export class ChatwootService {
 
             return send;
           } else {
-            this.logger.verbose('message is not group');
-
-            this.logger.verbose('send data to chatwoot');
             const send = await this.sendData(
               getConversation,
               fileName,
@@ -1971,6 +1879,7 @@ export class ChatwootService {
               instance,
               body,
               'WAID:' + body.key.id,
+              quotedMsg,
             );
 
             if (!send) {
@@ -1982,9 +1891,7 @@ export class ChatwootService {
           }
         }
 
-        this.logger.verbose('check if has ReactionMessage');
         if (reactionMessage) {
-          this.logger.verbose('send data to chatwoot');
           if (reactionMessage.text) {
             const send = await this.createMessage(
               instance,
@@ -1997,6 +1904,7 @@ export class ChatwootService {
                 message: { extendedTextMessage: { contextInfo: { stanzaId: reactionMessage.key.id } } },
               },
               'WAID:' + body.key.id,
+              quotedMsg,
             );
             if (!send) {
               this.logger.warn('message not sent');
@@ -2007,11 +1915,7 @@ export class ChatwootService {
           return;
         }
 
-        this.logger.verbose('check if has Ads Message');
         if (adsMessage) {
-          this.logger.verbose('message is from Ads');
-
-          this.logger.verbose('get base64 from media ads message');
           const imgBuffer = await axios.get(adsMessage.thumbnailUrl, { responseType: 'arraybuffer' });
 
           const extension = mimeTypes.extension(imgBuffer.headers['content-type']);
@@ -2027,8 +1931,6 @@ export class ChatwootService {
           const fileData = Buffer.from(imgBuffer.data, 'binary');
           const fileName = `${path.join(waInstance?.storePath, 'temp', `${nameFile}`)}`;
 
-          this.logger.verbose('temp file name: ' + nameFile);
-          this.logger.verbose('create temp file');
           await Jimp.read(fileData)
             .then(async (img) => {
               await img.cover(320, 180).writeAsync(fileName);
@@ -2043,7 +1945,6 @@ export class ChatwootService {
           const title = truncStr(adsMessage.title, 40);
           const description = truncStr(adsMessage.body, 75);
 
-          this.logger.verbose('send data to chatwoot');
           const send = await this.sendData(
             getConversation,
             fileName,
@@ -2062,22 +1963,17 @@ export class ChatwootService {
           return send;
         }
 
-        this.logger.verbose('check if is group');
         if (body.key.remoteJid.includes('@g.us')) {
-          this.logger.verbose('message is group');
           const participantName = body.pushName;
 
           let content: string;
 
           if (!body.key.fromMe) {
-            this.logger.verbose('message is not from me');
             content = `**${participantName}**\n\n${bodyMessage}`;
           } else {
-            this.logger.verbose('message is from me');
             content = `${bodyMessage}`;
           }
 
-          this.logger.verbose('send data to chatwoot');
           const send = await this.createMessage(
             instance,
             getConversation,
@@ -2087,6 +1983,7 @@ export class ChatwootService {
             [],
             body,
             'WAID:' + body.key.id,
+            quotedMsg,
           );
 
           if (!send) {
@@ -2096,9 +1993,6 @@ export class ChatwootService {
 
           return send;
         } else {
-          this.logger.verbose('message is not group');
-
-          this.logger.verbose('send data to chatwoot');
           const send = await this.createMessage(
             instance,
             getConversation,
@@ -2108,6 +2002,7 @@ export class ChatwootService {
             [],
             body,
             'WAID:' + body.key.id,
+            quotedMsg,
           );
 
           if (!send) {
@@ -2121,31 +2016,30 @@ export class ChatwootService {
 
       if (event === Events.MESSAGES_DELETE) {
         const chatwootDelete = this.configService.get<Chatwoot>('CHATWOOT').MESSAGE_DELETE;
-        if (chatwootDelete === true) {
-          this.logger.verbose('deleting message from instance: ' + instance.instanceName);
 
+        if (chatwootDelete === true) {
           if (!body?.key?.id) {
             this.logger.warn('message id not found');
             return;
           }
 
           const message = await this.getMessageByKeyId(instance, body.key.id);
-          if (message?.chatwoot?.messageId && message?.chatwoot?.conversationId) {
-            this.logger.verbose('deleting message in repository. Message id: ' + body.key.id);
-            this.repository.message.delete({
+
+          if (message?.chatwootMessageId && message?.chatwootConversationId) {
+            await this.prismaRepository.message.deleteMany({
               where: {
                 key: {
-                  id: body.key.id,
+                  path: ['id'],
+                  equals: body.key.id,
                 },
-                owner: instance.instanceName,
+                instanceId: instance.instanceId,
               },
             });
 
-            this.logger.verbose('deleting message in chatwoot. Message id: ' + body.key.id);
             return await client.messages.delete({
-              accountId: this.provider.account_id,
-              conversationId: message.chatwoot.conversationId,
-              messageId: message.chatwoot.messageId,
+              accountId: this.provider.accountId,
+              conversationId: message.chatwootConversationId,
+              messageId: message.chatwootMessageId,
             });
           }
         }
@@ -2156,20 +2050,28 @@ export class ChatwootService {
           body?.editedMessage?.conversation || body?.editedMessage?.extendedTextMessage?.text
         }\n\n_\`${i18next.t('cw.message.edited')}.\`_`;
         const message = await this.getMessageByKeyId(instance, body?.key?.id);
-        const messageType = message.key?.fromMe ? 'outgoing' : 'incoming';
+        const key = message.key as {
+          id: string;
+          fromMe: boolean;
+          remoteJid: string;
+          participant?: string;
+        };
 
-        if (message && message.chatwoot?.conversationId) {
+        const messageType = key?.fromMe ? 'outgoing' : 'incoming';
+
+        if (message && message.chatwootConversationId) {
           const send = await this.createMessage(
             instance,
-            message.chatwoot.conversationId,
+            message.chatwootConversationId,
             editedText,
             messageType,
             false,
             [],
             {
-              message: { extendedTextMessage: { contextInfo: { stanzaId: message.key.id } } },
+              message: { extendedTextMessage: { contextInfo: { stanzaId: key.id } } },
             },
             'WAID:' + body.key.id,
+            null,
           );
           if (!send) {
             this.logger.warn('edited message not sent');
@@ -2180,24 +2082,24 @@ export class ChatwootService {
       }
 
       if (event === 'messages.read') {
-        this.logger.verbose('read message from instance: ' + instance.instanceName);
-
         if (!body?.key?.id || !body?.key?.remoteJid) {
           this.logger.warn('message id not found');
           return;
         }
 
         const message = await this.getMessageByKeyId(instance, body.key.id);
-        const { conversationId, contactInbox } = message?.chatwoot || {};
+        const conversationId = message?.chatwootConversationId;
+        const contactInboxSourceId = message?.chatwootContactInboxSourceId;
+
         if (conversationId) {
-          let sourceId = contactInbox?.sourceId;
+          let sourceId = contactInboxSourceId;
           const inbox = (await this.getInbox(instance)) as inbox & {
             inbox_identifier?: string;
           };
 
           if (!sourceId && inbox) {
             const conversation = (await client.conversations.get({
-              accountId: this.provider.account_id,
+              accountId: this.provider.accountId,
               conversationId: conversationId,
             })) as conversation_show & {
               last_non_activity_message: { conversation: { contact_inbox: contact_inboxes } };
@@ -2219,7 +2121,6 @@ export class ChatwootService {
       }
 
       if (event === 'status.instance') {
-        this.logger.verbose('event status.instance');
         const data = body;
         const inbox = await this.getInbox(instance);
 
@@ -2233,18 +2134,14 @@ export class ChatwootService {
           state: data.status,
         });
 
-        this.logger.verbose('send message to chatwoot');
         await this.createBotMessage(instance, msgStatus, 'incoming');
       }
 
       if (event === 'connection.update') {
-        this.logger.verbose('event connection.update');
-
         if (body.status === 'open') {
           // if we have qrcode count then we understand that a new connection was established
           if (this.waMonitor.waInstances[instance.instanceName].qrCode.count > 0) {
             const msgConnection = i18next.t('cw.inbox.connected');
-            this.logger.verbose('send message to chatwoot');
             await this.createBotMessage(instance, msgConnection, 'incoming');
             this.waMonitor.waInstances[instance.instanceName].qrCode.count = 0;
             chatwootImport.clearAll(instance);
@@ -2253,26 +2150,16 @@ export class ChatwootService {
       }
 
       if (event === 'qrcode.updated') {
-        this.logger.verbose('event qrcode.updated');
         if (body.statusCode === 500) {
-          this.logger.verbose('qrcode error');
-
           const erroQRcode = `🚨 ${i18next.t('qrlimitreached')}`;
-
-          this.logger.verbose('send message to chatwoot');
           return await this.createBotMessage(instance, erroQRcode, 'incoming');
         } else {
-          this.logger.verbose('qrcode success');
           const fileData = Buffer.from(body?.qrcode.base64.replace('data:image/png;base64,', ''), 'base64');
 
           const fileName = `${path.join(waInstance?.storePath, 'temp', `${instance.instanceName}.png`)}`;
 
-          this.logger.verbose('temp file name: ' + fileName);
-
-          this.logger.verbose('create temp file');
           writeFileSync(fileName, fileData, 'utf8');
 
-          this.logger.verbose('send qrcode to chatwoot');
           await this.createBotQr(instance, i18next.t('qrgeneratedsuccesfully'), 'incoming', fileName);
 
           let msgQrCode = `⚡️${i18next.t('qrgeneratedsuccesfully')}\n\n${i18next.t('scanqr')}`;
@@ -2286,7 +2173,6 @@ export class ChatwootService {
               )}`;
           }
 
-          this.logger.verbose('send message to chatwoot');
           await this.createBotMessage(instance, msgQrCode, 'incoming');
         }
       }
@@ -2313,10 +2199,7 @@ export class ChatwootService {
     return uri && uri !== 'postgres://user:password@hostname:port/dbname';
   }
 
-  /* We can't proccess messages exactly in batch because Chatwoot use message id to order
-     messages in frontend and we are receiving the messages mixed between the batches.
-     Because this, we need to put all batches together and order after */
-  public addHistoryMessages(instance: InstanceDto, messagesRaw: MessageRaw[]) {
+  public addHistoryMessages(instance: InstanceDto, messagesRaw: MessageModel[]) {
     if (!this.isImportHistoryAvailable()) {
       return;
     }
@@ -2324,7 +2207,7 @@ export class ChatwootService {
     chatwootImport.addHistoryMessages(instance, messagesRaw);
   }
 
-  public addHistoryContacts(instance: InstanceDto, contactsRaw: ContactRaw[]) {
+  public addHistoryContacts(instance: InstanceDto, contactsRaw: ContactModel[]) {
     if (!this.isImportHistoryAvailable()) {
       return;
     }
@@ -2380,22 +2263,28 @@ export class ChatwootService {
         limitContacts,
       );
 
+      const contactIdentifiers = recentContacts
+        .map((contact) => contact.identifier)
+        .filter((identifier) => identifier !== null);
+
       const contactsWithProfilePicture = (
-        await this.repository.contact.find({
+        await this.prismaRepository.contact.findMany({
           where: {
-            owner: instance.instanceName,
+            instanceId: instance.instanceId,
             id: {
-              $in: recentContacts.map((contact) => contact.identifier),
+              in: contactIdentifiers,
             },
-            profilePictureUrl: { $ne: null },
+            profilePicUrl: {
+              not: null,
+            },
           },
-        } as any)
-      ).reduce((acc: Map<string, ContactRaw>, contact: ContactRaw) => acc.set(contact.id, contact), new Map());
+        })
+      ).reduce((acc: Map<string, ContactModel>, contact: ContactModel) => acc.set(contact.id, contact), new Map());
 
       recentContacts.forEach(async (contact) => {
         if (contactsWithProfilePicture.has(contact.identifier)) {
           client.contacts.update({
-            accountId: this.provider.account_id,
+            accountId: this.provider.accountId,
             id: contact.id,
             data: {
               avatar_url: contactsWithProfilePicture.get(contact.identifier).profilePictureUrl || null,

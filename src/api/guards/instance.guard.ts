@@ -1,16 +1,13 @@
 import { NextFunction, Request, Response } from 'express';
-import { existsSync } from 'fs';
-import { join } from 'path';
 
 import { CacheConf, configService, Database } from '../../config/env.config';
-import { INSTANCE_DIR } from '../../config/path.config';
 import {
   BadRequestException,
   ForbiddenException,
   InternalServerErrorException,
   NotFoundException,
 } from '../../exceptions';
-import { dbserver } from '../../libs/db.connect';
+import { prismaServer } from '../../libs/prisma.connect';
 import { InstanceDto } from '../dto/instance.dto';
 import { cache, waMonitor } from '../server.module';
 
@@ -28,14 +25,12 @@ async function getInstance(instanceName: string) {
     }
 
     if (db.ENABLED) {
-      const collection = dbserver
-        .getClient()
-        .db(db.CONNECTION.DB_PREFIX_NAME + '-instances')
-        .collection(instanceName);
-      return exists || (await collection.find({}).toArray()).length > 0;
+      const prisma = prismaServer;
+
+      return exists || (await prisma.instance.findMany({ where: { name: instanceName } })).length > 0;
     }
 
-    return exists || existsSync(join(INSTANCE_DIR, instanceName));
+    return false;
   } catch (error) {
     throw new InternalServerErrorException(error?.toString());
   }
@@ -67,6 +62,7 @@ export async function instanceLoggedGuard(req: Request, _: Response, next: NextF
 
     if (waMonitor.waInstances[instance.instanceName]) {
       waMonitor.waInstances[instance.instanceName]?.removeRabbitmqQueues();
+      waMonitor.waInstances[instance.instanceName]?.removeSqsQueues();
       delete waMonitor.waInstances[instance.instanceName];
     }
   }

@@ -1,6 +1,6 @@
+import { Contact, Message } from '@prisma/client';
 import { WASocket } from '@whiskeysockets/baileys';
 import axios from 'axios';
-import { execSync } from 'child_process';
 import { isURL } from 'class-validator';
 import EventEmitter2 from 'eventemitter2';
 import { join } from 'path';
@@ -8,9 +8,8 @@ import { v4 } from 'uuid';
 
 import {
   Auth,
-  CleanStoreConf,
+  Chatwoot,
   ConfigService,
-  Database,
   HttpServer,
   Log,
   Rabbitmq,
@@ -21,20 +20,20 @@ import {
 import { Logger } from '../../config/logger.config';
 import { ROOT_DIR } from '../../config/path.config';
 import { NotFoundException } from '../../exceptions';
-import { ChamaaiService } from '../integrations/chamaai/services/chamaai.service';
-import { ChatwootRaw } from '../integrations/chatwoot/models/chatwoot.model';
+import { InstanceDto } from '../dto/instance.dto';
+import { ProxyDto } from '../dto/proxy.dto';
+import { SettingsDto } from '../dto/settings.dto';
+import { WebhookDto } from '../dto/webhook.dto';
+import { ChatwootDto } from '../integrations/chatwoot/dto/chatwoot.dto';
 import { ChatwootService } from '../integrations/chatwoot/services/chatwoot.service';
+import { RabbitmqDto } from '../integrations/rabbitmq/dto/rabbitmq.dto';
 import { getAMQP, removeQueues } from '../integrations/rabbitmq/libs/amqp.server';
+import { SqsDto } from '../integrations/sqs/dto/sqs.dto';
 import { getSQS, removeQueues as removeQueuesSQS } from '../integrations/sqs/libs/sqs.server';
 import { TypebotService } from '../integrations/typebot/services/typebot.service';
+import { WebsocketDto } from '../integrations/websocket/dto/websocket.dto';
 import { getIO } from '../integrations/websocket/libs/socket.server';
-import { WebsocketRaw } from '../integrations/websocket/models/websocket.model';
-import { ChamaaiRaw, IntegrationRaw, ProxyRaw, RabbitmqRaw, SettingsRaw, SqsRaw, TypebotRaw } from '../models';
-import { WebhookRaw } from '../models/webhook.model';
-import { ContactQuery } from '../repository/contact.repository';
-import { MessageQuery } from '../repository/message.repository';
-import { MessageUpQuery } from '../repository/messageUp.repository';
-import { RepositoryBroker } from '../repository/repository.manager';
+import { PrismaRepository, Query } from '../repository/repository.service';
 import { waMonitor } from '../server.module';
 import { Events, wa } from '../types/wa.types';
 import { CacheService } from './cache.service';
@@ -43,11 +42,9 @@ export class ChannelStartupService {
   constructor(
     public readonly configService: ConfigService,
     public readonly eventEmitter: EventEmitter2,
-    public readonly repository: RepositoryBroker,
+    public readonly prismaRepository: PrismaRepository,
     public readonly chatwootCache: CacheService,
-  ) {
-    this.logger.verbose('ChannelStartupService initialized');
-  }
+  ) {}
 
   public readonly logger = new Logger(ChannelStartupService.name);
 
@@ -58,37 +55,33 @@ export class ChannelStartupService {
   public readonly localWebsocket: wa.LocalWebsocket = {};
   public readonly localRabbitmq: wa.LocalRabbitmq = {};
   public readonly localSqs: wa.LocalSqs = {};
-  public readonly localTypebot: wa.LocalTypebot = {};
   public readonly localProxy: wa.LocalProxy = {};
-  public readonly localChamaai: wa.LocalChamaai = {};
-  public readonly localIntegration: wa.LocalIntegration = {};
   public readonly localSettings: wa.LocalSettings = {};
   public readonly storePath = join(ROOT_DIR, 'store');
 
-  public chatwootService = new ChatwootService(waMonitor, this.configService, this.repository, this.chatwootCache);
+  public chatwootService = new ChatwootService(
+    waMonitor,
+    this.configService,
+    this.prismaRepository,
+    this.chatwootCache,
+  );
 
-  public typebotService = new TypebotService(waMonitor, this.configService, this.eventEmitter);
+  public typebotService = new TypebotService(waMonitor, this.configService, this.prismaRepository);
 
-  public chamaaiService = new ChamaaiService(waMonitor, this.configService);
+  public setInstance(instance: InstanceDto) {
+    this.instance.name = instance.instanceName;
+    this.logger.setInstance(instance.instanceName);
+    this.instance.id = instance.instanceId;
+    this.instance.integration = instance.integration;
+    this.instance.number = instance.number;
+    this.instance.token = instance.token;
 
-  public set instanceName(name: string) {
-    this.logger.setInstance(name);
-
-    this.logger.verbose(`Initializing instance '${name}'`);
-    if (!name) {
-      this.logger.verbose('Instance name not found, generating random name with uuid');
-      this.instance.name = v4();
-      return;
-    }
-    this.instance.name = name;
-    this.logger.verbose(`Instance '${this.instance.name}' initialized`);
-    this.logger.verbose('Sending instance status to webhook');
     this.sendDataWebhook(Events.STATUS_INSTANCE, {
       instance: this.instance.name,
       status: 'created',
     });
 
-    if (this.localChatwoot.enabled) {
+    if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot.enabled) {
       this.chatwootService.eventWhatsapp(
         Events.STATUS_INSTANCE,
         { instanceName: this.instance.name },
@@ -100,591 +93,468 @@ export class ChannelStartupService {
     }
   }
 
+  public set instanceName(name: string) {
+    this.logger.setInstance(name);
+
+    if (!name) {
+      this.instance.name = v4();
+      return;
+    }
+    this.instance.name = name;
+  }
+
   public get instanceName() {
-    this.logger.verbose('Getting instance name');
     return this.instance.name;
   }
 
+  public set instanceId(id: string) {
+    if (!id) {
+      this.instance.id = v4();
+      return;
+    }
+    this.instance.id = id;
+  }
+
+  public get instanceId() {
+    return this.instance.id;
+  }
+
+  public set integration(integration: string) {
+    this.instance.integration = integration;
+  }
+
+  public get integration() {
+    return this.instance.integration;
+  }
+
+  public set number(number: string) {
+    this.instance.number = number;
+  }
+
+  public get number() {
+    return this.instance.number;
+  }
+
+  public set token(token: string) {
+    this.instance.token = token;
+  }
+
+  public get token() {
+    return this.instance.token;
+  }
+
   public get wuid() {
-    this.logger.verbose('Getting remoteJid of instance');
     return this.instance.wuid;
   }
 
-  public async loadIntegration() {
-    this.logger.verbose('Loading webhook');
-    const data = await this.repository.integration.find(this.instanceName);
-    this.localIntegration.integration = data?.integration;
-    this.logger.verbose(`Integration: ${this.localIntegration.integration}`);
-
-    this.localIntegration.number = data?.number;
-    this.logger.verbose(`Integration number: ${this.localIntegration.number}`);
-
-    this.localIntegration.token = data?.token;
-    this.logger.verbose(`Integration token: ${this.localIntegration.token}`);
-
-    this.logger.verbose('Integration loaded');
-  }
-
-  public async setIntegration(data: IntegrationRaw) {
-    this.logger.verbose('Setting integration');
-    await this.repository.integration.create(data, this.instanceName);
-    this.logger.verbose(`Integration: ${data.integration}`);
-    this.logger.verbose(`Integration number: ${data.number}`);
-    this.logger.verbose(`Integration token: ${data.token}`);
-    Object.assign(this.localIntegration, data);
-    this.logger.verbose('Integration set');
-  }
-
-  public async findIntegration() {
-    this.logger.verbose('Finding integration');
-    let data: any;
-
-    data = await this.repository.integration.find(this.instanceName);
-
-    if (!data) {
-      this.repository.integration.create({ integration: 'WHATSAPP-BAILEYS', number: '', token: '' }, this.instanceName);
-      data = { integration: 'WHATSAPP-BAILEYS', number: '', token: '' };
-    }
-
-    this.logger.verbose(`Integration: ${data.integration}`);
-    this.logger.verbose(`Integration number: ${data.number}`);
-    this.logger.verbose(`Integration token: ${data.token}`);
-
-    return {
-      integration: data.integration,
-      number: data.number,
-      token: data.token,
-    };
-  }
-
   public async loadSettings() {
-    this.logger.verbose('Loading settings');
-    const data = await this.repository.settings.find(this.instanceName);
-    this.localSettings.reject_call = data?.reject_call;
-    this.logger.verbose(`Settings reject_call: ${this.localSettings.reject_call}`);
+    const data = await this.prismaRepository.setting.findUnique({
+      where: {
+        instanceId: this.instanceId,
+      },
+    });
 
-    this.localSettings.msg_call = data?.msg_call;
-    this.logger.verbose(`Settings msg_call: ${this.localSettings.msg_call}`);
-
-    this.localSettings.groups_ignore = data?.groups_ignore;
-    this.logger.verbose(`Settings groups_ignore: ${this.localSettings.groups_ignore}`);
-
-    this.localSettings.always_online = data?.always_online;
-    this.logger.verbose(`Settings always_online: ${this.localSettings.always_online}`);
-
-    this.localSettings.read_messages = data?.read_messages;
-    this.logger.verbose(`Settings read_messages: ${this.localSettings.read_messages}`);
-
-    this.localSettings.read_status = data?.read_status;
-    this.logger.verbose(`Settings read_status: ${this.localSettings.read_status}`);
-
-    this.localSettings.sync_full_history = data?.sync_full_history;
-    this.logger.verbose(`Settings sync_full_history: ${this.localSettings.sync_full_history}`);
-
-    this.logger.verbose('Settings loaded');
+    this.localSettings.rejectCall = data?.rejectCall;
+    this.localSettings.msgCall = data?.msgCall;
+    this.localSettings.groupsIgnore = data?.groupsIgnore;
+    this.localSettings.alwaysOnline = data?.alwaysOnline;
+    this.localSettings.readMessages = data?.readMessages;
+    this.localSettings.readStatus = data?.readStatus;
+    this.localSettings.syncFullHistory = data?.syncFullHistory;
   }
 
-  public async setSettings(data: SettingsRaw) {
-    this.logger.verbose('Setting settings');
-    await this.repository.settings.create(data, this.instanceName);
-    this.logger.verbose(`Settings reject_call: ${data.reject_call}`);
-    this.logger.verbose(`Settings msg_call: ${data.msg_call}`);
-    this.logger.verbose(`Settings groups_ignore: ${data.groups_ignore}`);
-    this.logger.verbose(`Settings always_online: ${data.always_online}`);
-    this.logger.verbose(`Settings read_messages: ${data.read_messages}`);
-    this.logger.verbose(`Settings read_status: ${data.read_status}`);
-    this.logger.verbose(`Settings sync_full_history: ${data.sync_full_history}`);
+  public async setSettings(data: SettingsDto) {
+    await this.prismaRepository.setting.upsert({
+      where: {
+        instanceId: this.instanceId,
+      },
+      update: {
+        rejectCall: data.rejectCall,
+        msgCall: data.msgCall,
+        groupsIgnore: data.groupsIgnore,
+        alwaysOnline: data.alwaysOnline,
+        readMessages: data.readMessages,
+        readStatus: data.readStatus,
+        syncFullHistory: data.syncFullHistory,
+      },
+      create: {
+        rejectCall: data.rejectCall,
+        msgCall: data.msgCall,
+        groupsIgnore: data.groupsIgnore,
+        alwaysOnline: data.alwaysOnline,
+        readMessages: data.readMessages,
+        readStatus: data.readStatus,
+        syncFullHistory: data.syncFullHistory,
+        instanceId: this.instanceId,
+      },
+    });
+
     Object.assign(this.localSettings, data);
-    this.logger.verbose('Settings set');
   }
 
   public async findSettings() {
-    this.logger.verbose('Finding settings');
-    const data = await this.repository.settings.find(this.instanceName);
+    const data = await this.prismaRepository.setting.findUnique({
+      where: {
+        instanceId: this.instanceId,
+      },
+    });
 
     if (!data) {
-      this.logger.verbose('Settings not found');
       return null;
     }
 
-    this.logger.verbose(`Settings url: ${data.reject_call}`);
-    this.logger.verbose(`Settings msg_call: ${data.msg_call}`);
-    this.logger.verbose(`Settings groups_ignore: ${data.groups_ignore}`);
-    this.logger.verbose(`Settings always_online: ${data.always_online}`);
-    this.logger.verbose(`Settings read_messages: ${data.read_messages}`);
-    this.logger.verbose(`Settings read_status: ${data.read_status}`);
-    this.logger.verbose(`Settings sync_full_history: ${data.sync_full_history}`);
     return {
-      reject_call: data.reject_call,
-      msg_call: data.msg_call,
-      groups_ignore: data.groups_ignore,
-      always_online: data.always_online,
-      read_messages: data.read_messages,
-      read_status: data.read_status,
-      sync_full_history: data.sync_full_history,
+      rejectCall: data.rejectCall,
+      msgCall: data.msgCall,
+      groupsIgnore: data.groupsIgnore,
+      alwaysOnline: data.alwaysOnline,
+      readMessages: data.readMessages,
+      readStatus: data.readStatus,
+      syncFullHistory: data.syncFullHistory,
     };
   }
 
   public async loadWebhook() {
-    this.logger.verbose('Loading webhook');
-    const data = await this.repository.webhook.find(this.instanceName);
+    const data = await this.prismaRepository.webhook.findUnique({
+      where: {
+        instanceId: this.instanceId,
+      },
+    });
+
     this.localWebhook.url = data?.url;
-    this.logger.verbose(`Webhook url: ${this.localWebhook.url}`);
-
     this.localWebhook.enabled = data?.enabled;
-    this.logger.verbose(`Webhook enabled: ${this.localWebhook.enabled}`);
-
     this.localWebhook.events = data?.events;
-    this.logger.verbose(`Webhook events: ${this.localWebhook.events}`);
-
-    this.localWebhook.webhook_by_events = data?.webhook_by_events;
-    this.logger.verbose(`Webhook by events: ${this.localWebhook.webhook_by_events}`);
-
-    this.localWebhook.webhook_base64 = data?.webhook_base64;
-    this.logger.verbose(`Webhook by webhook_base64: ${this.localWebhook.webhook_base64}`);
-
-    this.logger.verbose('Webhook loaded');
+    this.localWebhook.webhookByEvents = data?.webhookByEvents;
+    this.localWebhook.webhookBase64 = data?.webhookBase64;
   }
 
-  public async setWebhook(data: WebhookRaw) {
-    this.logger.verbose('Setting webhook');
-    await this.repository.webhook.create(data, this.instanceName);
-    this.logger.verbose(`Webhook url: ${data.url}`);
-    this.logger.verbose(`Webhook events: ${data.events}`);
+  public async setWebhook(data: WebhookDto) {
+    await this.prismaRepository.webhook.create({
+      data: {
+        url: data.url,
+        enabled: data.enabled,
+        events: data.events,
+        webhookByEvents: data.webhookByEvents,
+        webhookBase64: data.webhookBase64,
+        instanceId: this.instanceId,
+      },
+    });
+
     Object.assign(this.localWebhook, data);
-    this.logger.verbose('Webhook set');
   }
 
   public async findWebhook() {
-    this.logger.verbose('Finding webhook');
-    const data = await this.repository.webhook.find(this.instanceName);
+    const data = await this.prismaRepository.webhook.findUnique({
+      where: {
+        instanceId: this.instanceId,
+      },
+    });
 
     if (!data) {
-      this.logger.verbose('Webhook not found');
       throw new NotFoundException('Webhook not found');
     }
 
-    this.logger.verbose(`Webhook url: ${data.url}`);
-    this.logger.verbose(`Webhook events: ${data.events}`);
-
-    return {
-      enabled: data.enabled,
-      url: data.url,
-      events: data.events,
-      webhook_by_events: data.webhook_by_events,
-      webhook_base64: data.webhook_base64,
-    };
+    return data;
   }
 
   public async loadChatwoot() {
-    this.logger.verbose('Loading chatwoot');
-    const data = await this.repository.chatwoot.find(this.instanceName);
+    if (!this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
+      return;
+    }
+
+    const data = await this.prismaRepository.chatwoot.findUnique({
+      where: {
+        instanceId: this.instanceId,
+      },
+    });
+
     this.localChatwoot.enabled = data?.enabled;
-    this.logger.verbose(`Chatwoot enabled: ${this.localChatwoot.enabled}`);
-
-    this.localChatwoot.account_id = data?.account_id;
-    this.logger.verbose(`Chatwoot account id: ${this.localChatwoot.account_id}`);
-
+    this.localChatwoot.accountId = data?.accountId;
     this.localChatwoot.token = data?.token;
-    this.logger.verbose(`Chatwoot token: ${this.localChatwoot.token}`);
-
     this.localChatwoot.url = data?.url;
-    this.logger.verbose(`Chatwoot url: ${this.localChatwoot.url}`);
-
-    this.localChatwoot.name_inbox = data?.name_inbox;
-    this.logger.verbose(`Chatwoot inbox name: ${this.localChatwoot.name_inbox}`);
-
-    this.localChatwoot.sign_msg = data?.sign_msg;
-    this.logger.verbose(`Chatwoot sign msg: ${this.localChatwoot.sign_msg}`);
-
+    this.localChatwoot.nameInbox = data?.nameInbox;
+    this.localChatwoot.signMsg = data?.signMsg;
+    this.localChatwoot.signDelimiter = data?.signDelimiter;
     this.localChatwoot.number = data?.number;
-    this.logger.verbose(`Chatwoot number: ${this.localChatwoot.number}`);
-
-    this.localChatwoot.reopen_conversation = data?.reopen_conversation;
-    this.logger.verbose(`Chatwoot reopen conversation: ${this.localChatwoot.reopen_conversation}`);
-
-    this.localChatwoot.conversation_pending = data?.conversation_pending;
-    this.logger.verbose(`Chatwoot conversation pending: ${this.localChatwoot.conversation_pending}`);
-
-    this.localChatwoot.merge_brazil_contacts = data?.merge_brazil_contacts;
-    this.logger.verbose(`Chatwoot merge brazil contacts: ${this.localChatwoot.merge_brazil_contacts}`);
-
-    this.localChatwoot.import_contacts = data?.import_contacts;
-    this.logger.verbose(`Chatwoot import contacts: ${this.localChatwoot.import_contacts}`);
-
-    this.localChatwoot.import_messages = data?.import_messages;
-    this.logger.verbose(`Chatwoot import messages: ${this.localChatwoot.import_messages}`);
-
-    this.localChatwoot.days_limit_import_messages = data?.days_limit_import_messages;
-    this.logger.verbose(`Chatwoot days limit import messages: ${this.localChatwoot.days_limit_import_messages}`);
-
-    this.logger.verbose('Chatwoot loaded');
+    this.localChatwoot.reopenConversation = data?.reopenConversation;
+    this.localChatwoot.conversationPending = data?.conversationPending;
+    this.localChatwoot.mergeBrazilContacts = data?.mergeBrazilContacts;
+    this.localChatwoot.importContacts = data?.importContacts;
+    this.localChatwoot.importMessages = data?.importMessages;
+    this.localChatwoot.daysLimitImportMessages = data?.daysLimitImportMessages;
   }
 
-  public async setChatwoot(data: ChatwootRaw) {
-    this.logger.verbose('Setting chatwoot');
-    await this.repository.chatwoot.create(data, this.instanceName);
-    this.logger.verbose(`Chatwoot account id: ${data.account_id}`);
-    this.logger.verbose(`Chatwoot token: ${data.token}`);
-    this.logger.verbose(`Chatwoot url: ${data.url}`);
-    this.logger.verbose(`Chatwoot inbox name: ${data.name_inbox}`);
-    this.logger.verbose(`Chatwoot sign msg: ${data.sign_msg}`);
-    this.logger.verbose(`Chatwoot sign delimiter: ${data.sign_delimiter}`);
-    this.logger.verbose(`Chatwoot reopen conversation: ${data.reopen_conversation}`);
-    this.logger.verbose(`Chatwoot conversation pending: ${data.conversation_pending}`);
-    this.logger.verbose(`Chatwoot merge brazil contacts: ${data.merge_brazil_contacts}`);
-    this.logger.verbose(`Chatwoot import contacts: ${data.import_contacts}`);
-    this.logger.verbose(`Chatwoot import messages: ${data.import_messages}`);
-    this.logger.verbose(`Chatwoot days limit import messages: ${data.days_limit_import_messages}`);
+  public async setChatwoot(data: ChatwootDto) {
+    if (!this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
+      return;
+    }
 
-    Object.assign(this.localChatwoot, { ...data, sign_delimiter: data.sign_msg ? data.sign_delimiter : null });
+    const chatwoot = await this.prismaRepository.chatwoot.findUnique({
+      where: {
+        instanceId: this.instanceId,
+      },
+    });
+
+    if (chatwoot) {
+      await this.prismaRepository.chatwoot.update({
+        where: {
+          instanceId: this.instanceId,
+        },
+        data: {
+          enabled: data.enabled,
+          accountId: data.accountId,
+          token: data.token,
+          url: data.url,
+          nameInbox: data.nameInbox,
+          signMsg: data.signMsg,
+          signDelimiter: data.signMsg ? data.signDelimiter : null,
+          number: data.number,
+          reopenConversation: data.reopenConversation,
+          conversationPending: data.conversationPending,
+          mergeBrazilContacts: data.mergeBrazilContacts,
+          importContacts: data.importContacts,
+          importMessages: data.importMessages,
+          daysLimitImportMessages: data.daysLimitImportMessages,
+          organization: data.organization,
+          logo: data.logo,
+        },
+      });
+
+      Object.assign(this.localChatwoot, { ...data, signDelimiter: data.signMsg ? data.signDelimiter : null });
+
+      this.clearCacheChatwoot();
+      return;
+    }
+
+    await this.prismaRepository.chatwoot.create({
+      data: {
+        enabled: data.enabled,
+        accountId: data.accountId,
+        token: data.token,
+        url: data.url,
+        nameInbox: data.nameInbox,
+        signMsg: data.signMsg,
+        number: data.number,
+        reopenConversation: data.reopenConversation,
+        conversationPending: data.conversationPending,
+        mergeBrazilContacts: data.mergeBrazilContacts,
+        importContacts: data.importContacts,
+        importMessages: data.importMessages,
+        daysLimitImportMessages: data.daysLimitImportMessages,
+        instanceId: this.instanceId,
+      },
+    });
+
+    Object.assign(this.localChatwoot, { ...data, signDelimiter: data.signMsg ? data.signDelimiter : null });
 
     this.clearCacheChatwoot();
-
-    this.logger.verbose('Chatwoot set');
   }
 
   public async findChatwoot() {
-    this.logger.verbose('Finding chatwoot');
-    const data = await this.repository.chatwoot.find(this.instanceName);
-
-    if (!data) {
-      this.logger.verbose('Chatwoot not found');
+    if (!this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
       return null;
     }
 
-    this.logger.verbose(`Chatwoot account id: ${data.account_id}`);
-    this.logger.verbose(`Chatwoot token: ${data.token}`);
-    this.logger.verbose(`Chatwoot url: ${data.url}`);
-    this.logger.verbose(`Chatwoot inbox name: ${data.name_inbox}`);
-    this.logger.verbose(`Chatwoot sign msg: ${data.sign_msg}`);
-    this.logger.verbose(`Chatwoot sign delimiter: ${data.sign_delimiter}`);
-    this.logger.verbose(`Chatwoot reopen conversation: ${data.reopen_conversation}`);
-    this.logger.verbose(`Chatwoot conversation pending: ${data.conversation_pending}`);
-    this.logger.verbose(`Chatwoot merge brazilian contacts: ${data.merge_brazil_contacts}`);
-    this.logger.verbose(`Chatwoot import contacts: ${data.import_contacts}`);
-    this.logger.verbose(`Chatwoot import messages: ${data.import_messages}`);
-    this.logger.verbose(`Chatwoot days limit import messages: ${data.days_limit_import_messages}`);
+    const data = await this.prismaRepository.chatwoot.findUnique({
+      where: {
+        instanceId: this.instanceId,
+      },
+    });
+
+    if (!data) {
+      return null;
+    }
 
     return {
       enabled: data.enabled,
-      account_id: data.account_id,
+      accountId: data.accountId,
       token: data.token,
       url: data.url,
-      name_inbox: data.name_inbox,
-      sign_msg: data.sign_msg,
-      sign_delimiter: data.sign_delimiter || null,
-      reopen_conversation: data.reopen_conversation,
-      conversation_pending: data.conversation_pending,
-      merge_brazil_contacts: data.merge_brazil_contacts,
-      import_contacts: data.import_contacts,
-      import_messages: data.import_messages,
-      days_limit_import_messages: data.days_limit_import_messages,
+      nameInbox: data.nameInbox,
+      signMsg: data.signMsg,
+      signDelimiter: data.signDelimiter || null,
+      reopenConversation: data.reopenConversation,
+      conversationPending: data.conversationPending,
+      mergeBrazilContacts: data.mergeBrazilContacts,
+      importContacts: data.importContacts,
+      importMessages: data.importMessages,
+      daysLimitImportMessages: data.daysLimitImportMessages,
     };
   }
 
   public clearCacheChatwoot() {
-    this.logger.verbose('Removing cache from chatwoot');
-
     if (this.localChatwoot.enabled) {
       this.chatwootService.getCache()?.deleteAll(this.instanceName);
     }
   }
 
   public async loadWebsocket() {
-    this.logger.verbose('Loading websocket');
-    const data = await this.repository.websocket.find(this.instanceName);
+    const data = await this.prismaRepository.websocket.findUnique({
+      where: {
+        instanceId: this.instanceId,
+      },
+    });
 
     this.localWebsocket.enabled = data?.enabled;
-    this.logger.verbose(`Websocket enabled: ${this.localWebsocket.enabled}`);
-
     this.localWebsocket.events = data?.events;
-    this.logger.verbose(`Websocket events: ${this.localWebsocket.events}`);
-
-    this.logger.verbose('Websocket loaded');
   }
 
-  public async setWebsocket(data: WebsocketRaw) {
-    this.logger.verbose('Setting websocket');
-    await this.repository.websocket.create(data, this.instanceName);
-    this.logger.verbose(`Websocket events: ${data.events}`);
+  public async setWebsocket(data: WebsocketDto) {
+    await this.prismaRepository.websocket.create({
+      data: {
+        enabled: data.enabled,
+        events: data.events,
+        instanceId: this.instanceId,
+      },
+    });
+
     Object.assign(this.localWebsocket, data);
-    this.logger.verbose('Websocket set');
   }
 
   public async findWebsocket() {
-    this.logger.verbose('Finding websocket');
-    const data = await this.repository.websocket.find(this.instanceName);
+    const data = await this.prismaRepository.websocket.findUnique({
+      where: {
+        instanceId: this.instanceId,
+      },
+    });
 
     if (!data) {
-      this.logger.verbose('Websocket not found');
       throw new NotFoundException('Websocket not found');
     }
 
-    this.logger.verbose(`Websocket events: ${data.events}`);
-    return {
-      enabled: data.enabled,
-      events: data.events,
-    };
+    return data;
   }
 
   public async loadRabbitmq() {
-    this.logger.verbose('Loading rabbitmq');
-    const data = await this.repository.rabbitmq.find(this.instanceName);
+    const data = await this.prismaRepository.rabbitmq.findUnique({
+      where: {
+        instanceId: this.instanceId,
+      },
+    });
 
     this.localRabbitmq.enabled = data?.enabled;
-    this.logger.verbose(`Rabbitmq enabled: ${this.localRabbitmq.enabled}`);
-
     this.localRabbitmq.events = data?.events;
-    this.logger.verbose(`Rabbitmq events: ${this.localRabbitmq.events}`);
-
-    this.logger.verbose('Rabbitmq loaded');
   }
 
-  public async setRabbitmq(data: RabbitmqRaw) {
-    this.logger.verbose('Setting rabbitmq');
-    await this.repository.rabbitmq.create(data, this.instanceName);
-    this.logger.verbose(`Rabbitmq events: ${data.events}`);
+  public async setRabbitmq(data: RabbitmqDto) {
+    await this.prismaRepository.rabbitmq.create({
+      data: {
+        enabled: data.enabled,
+        events: data.events,
+        instanceId: this.instanceId,
+      },
+    });
+
     Object.assign(this.localRabbitmq, data);
-    this.logger.verbose('Rabbitmq set');
   }
 
   public async findRabbitmq() {
-    this.logger.verbose('Finding rabbitmq');
-    const data = await this.repository.rabbitmq.find(this.instanceName);
+    const data = await this.prismaRepository.rabbitmq.findUnique({
+      where: {
+        instanceId: this.instanceId,
+      },
+    });
 
     if (!data) {
-      this.logger.verbose('Rabbitmq not found');
       throw new NotFoundException('Rabbitmq not found');
     }
 
-    this.logger.verbose(`Rabbitmq events: ${data.events}`);
-    return {
-      enabled: data.enabled,
-      events: data.events,
-    };
+    return data;
   }
 
   public async removeRabbitmqQueues() {
-    this.logger.verbose('Removing rabbitmq');
-
     if (this.localRabbitmq.enabled) {
       removeQueues(this.instanceName, this.localRabbitmq.events);
     }
   }
 
   public async loadSqs() {
-    this.logger.verbose('Loading sqs');
-    const data = await this.repository.sqs.find(this.instanceName);
+    const data = await this.prismaRepository.sqs.findUnique({
+      where: {
+        instanceId: this.instanceId,
+      },
+    });
 
     this.localSqs.enabled = data?.enabled;
-    this.logger.verbose(`Sqs enabled: ${this.localSqs.enabled}`);
-
     this.localSqs.events = data?.events;
-    this.logger.verbose(`Sqs events: ${this.localSqs.events}`);
-
-    this.logger.verbose('Sqs loaded');
   }
 
-  public async setSqs(data: SqsRaw) {
-    this.logger.verbose('Setting sqs');
-    await this.repository.sqs.create(data, this.instanceName);
-    this.logger.verbose(`Sqs events: ${data.events}`);
+  public async setSqs(data: SqsDto) {
+    await this.prismaRepository.sqs.create({
+      data: {
+        enabled: data.enabled,
+        events: data.events,
+        instanceId: this.instanceId,
+      },
+    });
+
     Object.assign(this.localSqs, data);
-    this.logger.verbose('Sqs set');
   }
 
   public async findSqs() {
-    this.logger.verbose('Finding sqs');
-    const data = await this.repository.sqs.find(this.instanceName);
+    const data = await this.prismaRepository.sqs.findUnique({
+      where: {
+        instanceId: this.instanceId,
+      },
+    });
 
     if (!data) {
-      this.logger.verbose('Sqs not found');
       throw new NotFoundException('Sqs not found');
     }
 
-    this.logger.verbose(`Sqs events: ${data.events}`);
-    return {
-      enabled: data.enabled,
-      events: data.events,
-    };
+    return data;
   }
 
   public async removeSqsQueues() {
-    this.logger.verbose('Removing sqs');
-
     if (this.localSqs.enabled) {
       removeQueuesSQS(this.instanceName, this.localSqs.events);
     }
   }
 
-  public async loadTypebot() {
-    this.logger.verbose('Loading typebot');
-    const data = await this.repository.typebot.find(this.instanceName);
-
-    this.localTypebot.enabled = data?.enabled;
-    this.logger.verbose(`Typebot enabled: ${this.localTypebot.enabled}`);
-
-    this.localTypebot.url = data?.url;
-    this.logger.verbose(`Typebot url: ${this.localTypebot.url}`);
-
-    this.localTypebot.typebot = data?.typebot;
-    this.logger.verbose(`Typebot typebot: ${this.localTypebot.typebot}`);
-
-    this.localTypebot.expire = data?.expire;
-    this.logger.verbose(`Typebot expire: ${this.localTypebot.expire}`);
-
-    this.localTypebot.keyword_finish = data?.keyword_finish;
-    this.logger.verbose(`Typebot keyword_finish: ${this.localTypebot.keyword_finish}`);
-
-    this.localTypebot.delay_message = data?.delay_message;
-    this.logger.verbose(`Typebot delay_message: ${this.localTypebot.delay_message}`);
-
-    this.localTypebot.unknown_message = data?.unknown_message;
-    this.logger.verbose(`Typebot unknown_message: ${this.localTypebot.unknown_message}`);
-
-    this.localTypebot.listening_from_me = data?.listening_from_me;
-    this.logger.verbose(`Typebot listening_from_me: ${this.localTypebot.listening_from_me}`);
-
-    this.localTypebot.sessions = data?.sessions;
-
-    this.logger.verbose('Typebot loaded');
-  }
-
-  public async setTypebot(data: TypebotRaw) {
-    this.logger.verbose('Setting typebot');
-    await this.repository.typebot.create(data, this.instanceName);
-    this.logger.verbose(`Typebot typebot: ${data.typebot}`);
-    this.logger.verbose(`Typebot expire: ${data.expire}`);
-    this.logger.verbose(`Typebot keyword_finish: ${data.keyword_finish}`);
-    this.logger.verbose(`Typebot delay_message: ${data.delay_message}`);
-    this.logger.verbose(`Typebot unknown_message: ${data.unknown_message}`);
-    this.logger.verbose(`Typebot listening_from_me: ${data.listening_from_me}`);
-    Object.assign(this.localTypebot, data);
-    this.logger.verbose('Typebot set');
-  }
-
-  public async findTypebot() {
-    this.logger.verbose('Finding typebot');
-    const data = await this.repository.typebot.find(this.instanceName);
-
-    if (!data) {
-      this.logger.verbose('Typebot not found');
-      throw new NotFoundException('Typebot not found');
-    }
-
-    return {
-      enabled: data.enabled,
-      url: data.url,
-      typebot: data.typebot,
-      expire: data.expire,
-      keyword_finish: data.keyword_finish,
-      delay_message: data.delay_message,
-      unknown_message: data.unknown_message,
-      listening_from_me: data.listening_from_me,
-      sessions: data.sessions,
-    };
-  }
-
   public async loadProxy() {
-    this.logger.verbose('Loading proxy');
-    const data = await this.repository.proxy.find(this.instanceName);
+    const data = await this.prismaRepository.proxy.findUnique({
+      where: {
+        instanceId: this.instanceId,
+      },
+    });
 
     this.localProxy.enabled = data?.enabled;
-    this.logger.verbose(`Proxy enabled: ${this.localProxy.enabled}`);
-
-    this.localProxy.proxy = data?.proxy;
-    this.logger.verbose(`Proxy proxy: ${this.localProxy.proxy?.host}`);
-
-    this.logger.verbose('Proxy loaded');
+    this.localProxy.host = data?.host;
+    this.localProxy.port = data?.port;
+    this.localProxy.protocol = data?.protocol;
+    this.localProxy.username = data?.username;
+    this.localProxy.password = data?.password;
   }
 
-  public async setProxy(data: ProxyRaw) {
-    this.logger.verbose('Setting proxy');
-    await this.repository.proxy.create(data, this.instanceName);
-    this.logger.verbose(`Proxy proxy: ${data.proxy}`);
+  public async setProxy(data: ProxyDto) {
+    await this.prismaRepository.proxy.create({
+      data: {
+        enabled: data.enabled,
+        host: data.host,
+        port: data.port,
+        protocol: data.protocol,
+        username: data.username,
+        password: data.password,
+        instanceId: this.instanceId,
+      },
+    });
+
     Object.assign(this.localProxy, data);
-    this.logger.verbose('Proxy set');
   }
 
   public async findProxy() {
-    this.logger.verbose('Finding proxy');
-    const data = await this.repository.proxy.find(this.instanceName);
+    const data = await this.prismaRepository.proxy.findUnique({
+      where: {
+        instanceId: this.instanceId,
+      },
+    });
 
     if (!data) {
-      this.logger.verbose('Proxy not found');
       throw new NotFoundException('Proxy not found');
     }
 
-    return {
-      enabled: data.enabled,
-      proxy: data.proxy,
-    };
+    return data;
   }
-
-  public async loadChamaai() {
-    this.logger.verbose('Loading chamaai');
-    const data = await this.repository.chamaai.find(this.instanceName);
-
-    this.localChamaai.enabled = data?.enabled;
-    this.logger.verbose(`Chamaai enabled: ${this.localChamaai.enabled}`);
-
-    this.localChamaai.url = data?.url;
-    this.logger.verbose(`Chamaai url: ${this.localChamaai.url}`);
-
-    this.localChamaai.token = data?.token;
-    this.logger.verbose(`Chamaai token: ${this.localChamaai.token}`);
-
-    this.localChamaai.waNumber = data?.waNumber;
-    this.logger.verbose(`Chamaai waNumber: ${this.localChamaai.waNumber}`);
-
-    this.localChamaai.answerByAudio = data?.answerByAudio;
-    this.logger.verbose(`Chamaai answerByAudio: ${this.localChamaai.answerByAudio}`);
-
-    this.logger.verbose('Chamaai loaded');
-  }
-
-  public async setChamaai(data: ChamaaiRaw) {
-    this.logger.verbose('Setting chamaai');
-    await this.repository.chamaai.create(data, this.instanceName);
-    this.logger.verbose(`Chamaai url: ${data.url}`);
-    this.logger.verbose(`Chamaai token: ${data.token}`);
-    this.logger.verbose(`Chamaai waNumber: ${data.waNumber}`);
-    this.logger.verbose(`Chamaai answerByAudio: ${data.answerByAudio}`);
-
-    Object.assign(this.localChamaai, data);
-    this.logger.verbose('Chamaai set');
-  }
-
-  public async findChamaai() {
-    this.logger.verbose('Finding chamaai');
-    const data = await this.repository.chamaai.find(this.instanceName);
-
-    if (!data) {
-      this.logger.verbose('Chamaai not found');
-      throw new NotFoundException('Chamaai not found');
-    }
-
-    return {
-      enabled: data.enabled,
-      url: data.url,
-      token: data.token,
-      waNumber: data.waNumber,
-      answerByAudio: data.answerByAudio,
-    };
-  }
-
-  private assertExchangeAsync = (channel, exchangeName, exchangeType, options) => {
-    return new Promise((resolve, reject) => {
-      channel.assertExchange(exchangeName, exchangeType, options, (error, ok) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(ok);
-        }
-      });
-    });
-  };
 
   public async sendDataWebhook<T = any>(event: Events, data: T, local = true) {
     const webhookGlobal = this.configService.get<Webhook>('WEBHOOK');
@@ -703,8 +573,8 @@ export class ChannelStartupService {
     const now = localISOTime;
 
     const expose = this.configService.get<Auth>('AUTHENTICATION').EXPOSE_IN_FETCH_INSTANCES;
-    const tokenStore = await this.repository.auth.find(this.instanceName);
-    const instanceApikey = tokenStore?.apikey || 'Apikey not found';
+
+    const instanceApikey = this.token || 'Apikey not found';
 
     if (rabbitmqEnabled) {
       const amqp = getAMQP();
@@ -910,7 +780,6 @@ export class ChannelStartupService {
     }
 
     if (this.configService.get<Websocket>('WEBSOCKET')?.ENABLED) {
-      this.logger.verbose('Sending data to websocket on channel: ' + this.instance.name);
       const io = getIO();
 
       const message = {
@@ -950,9 +819,6 @@ export class ChannelStartupService {
       }
 
       if (this.localWebsocket.enabled && Array.isArray(websocketLocal) && websocketLocal.includes(we)) {
-        this.logger.verbose('Sending data to websocket on event: ' + event);
-
-        this.logger.verbose('Sending data to socket.io in channel: ' + this.instance.name);
         io.of(`/${this.instance.name}`).emit(event, message);
 
         if (this.configService.get<Websocket>('WEBSOCKET')?.GLOBAL_EVENTS) {
@@ -984,10 +850,9 @@ export class ChannelStartupService {
 
     if (local) {
       if (Array.isArray(webhookLocal) && webhookLocal.includes(we)) {
-        this.logger.verbose('Sending data to webhook local');
         let baseURL: string;
 
-        if (this.localWebhook.webhook_by_events) {
+        if (this.localWebhook.webhookByEvents) {
           baseURL = `${this.localWebhook.url}/${transformedWe}`;
         } else {
           baseURL = this.localWebhook.url;
@@ -1052,7 +917,6 @@ export class ChannelStartupService {
 
     if (webhookGlobal.GLOBAL?.ENABLED) {
       if (webhookGlobal.EVENTS[we]) {
-        this.logger.verbose('Sending data to webhook global');
         const globalWebhook = this.configService.get<Webhook>('WEBHOOK').GLOBAL;
 
         let globalURL;
@@ -1122,31 +986,6 @@ export class ChannelStartupService {
     }
   }
 
-  public cleanStore() {
-    this.logger.verbose('Cronjob to clean store initialized');
-    const cleanStore = this.configService.get<CleanStoreConf>('CLEAN_STORE');
-    const database = this.configService.get<Database>('DATABASE');
-    if (cleanStore?.CLEANING_INTERVAL && !database.ENABLED) {
-      this.logger.verbose('Cronjob to clean store enabled');
-      setInterval(() => {
-        try {
-          for (const [key, value] of Object.entries(cleanStore)) {
-            if (value === true) {
-              execSync(
-                `rm -rf ${join(this.storePath, key.toLowerCase().replace('_', '-'), this.instance.name)}/*.json`,
-              );
-              this.logger.verbose(
-                `Cleaned ${join(this.storePath, key.toLowerCase().replace('_', '-'), this.instance.name)}/*.json`,
-              );
-            }
-          }
-        } catch (error) {
-          this.logger.error(error);
-        }
-      }, (cleanStore?.CLEANING_INTERVAL ?? 3600) * 1000);
-    }
-  }
-
   // Check if the number is MX or AR
   public formatMXOrARNumber(jid: string): string {
     const countryCode = jid.substring(0, 2);
@@ -1182,15 +1021,11 @@ export class ChannelStartupService {
   }
 
   public createJid(number: string): string {
-    this.logger.verbose('Creating jid with number: ' + number);
-
     if (number.includes('@g.us') || number.includes('@s.whatsapp.net') || number.includes('@lid')) {
-      this.logger.verbose('Number already contains @g.us or @s.whatsapp.net or @lid');
       return number;
     }
 
     if (number.includes('@broadcast')) {
-      this.logger.verbose('Number already contains @broadcast');
       return number;
     }
 
@@ -1203,7 +1038,6 @@ export class ChannelStartupService {
       .split('@')[0];
 
     if (number.includes('-') && number.length >= 24) {
-      this.logger.verbose('Jid created is group: ' + `${number}@g.us`);
       number = number.replace(/[^\d-]/g, '');
       return `${number}@g.us`;
     }
@@ -1211,7 +1045,6 @@ export class ChannelStartupService {
     number = number.replace(/\D/g, '');
 
     if (number.length >= 18) {
-      this.logger.verbose('Jid created is group: ' + `${number}@g.us`);
       number = number.replace(/[^\d-]/g, '');
       return `${number}@g.us`;
     }
@@ -1220,65 +1053,109 @@ export class ChannelStartupService {
 
     number = this.formatBRNumber(number);
 
-    this.logger.verbose('Jid created is whatsapp: ' + `${number}@s.whatsapp.net`);
     return `${number}@s.whatsapp.net`;
   }
 
-  public async fetchContacts(query: ContactQuery) {
-    this.logger.verbose('Fetching contacts');
-    if (query?.where) {
-      query.where.owner = this.instance.name;
-      if (query.where?.id) {
-        query.where.id = this.createJid(query.where.id);
-      }
-    } else {
-      query = {
-        where: {
-          owner: this.instance.name,
-        },
-      };
-    }
-    return await this.repository.contact.find(query);
+  public async fetchContacts(query: Query<Contact>) {
+    return await this.prismaRepository.contact.findMany({
+      where: {
+        instanceId: this.instanceId,
+        remoteJid: query.where?.remoteJid,
+      },
+    });
   }
 
-  public async fetchMessages(query: MessageQuery) {
-    this.logger.verbose('Fetching messages');
-    if (query?.where) {
-      if (query.where?.key?.remoteJid) {
-        query.where.key.remoteJid = this.createJid(query.where.key.remoteJid);
-      }
-      query.where.owner = this.instance.name;
-    } else {
-      query = {
-        where: {
-          owner: this.instance.name,
-        },
-        limit: query?.limit,
-      };
+  public async fetchMessages(query: Query<Message>) {
+    const keyFilters = query?.where?.key as {
+      id?: string;
+      fromMe?: boolean;
+      remoteJid?: string;
+      participants?: string;
+    };
+
+    const count = await this.prismaRepository.message.count({
+      where: {
+        instanceId: this.instanceId,
+        id: query?.where?.id,
+        source: query?.where?.source,
+        messageType: query?.where?.messageType,
+        AND: [
+          keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
+          keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
+          keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
+          keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
+        ],
+      },
+    });
+
+    if (!query?.offset) {
+      query.offset = 50;
     }
-    return await this.repository.message.find(query);
+
+    if (!query?.page) {
+      query.page = 1;
+    }
+
+    const messages = await this.prismaRepository.message.findMany({
+      where: {
+        instanceId: this.instanceId,
+        id: query?.where?.id,
+        source: query?.where?.source,
+        messageType: query?.where?.messageType,
+        AND: [
+          keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
+          keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
+          keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
+          keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
+        ],
+      },
+      orderBy: {
+        messageTimestamp: 'desc',
+      },
+      skip: query.offset * (query?.page === 1 ? 0 : (query?.page as number) - 1),
+      take: query.offset,
+      select: {
+        id: true,
+        key: true,
+        pushName: true,
+        messageType: true,
+        message: true,
+        messageTimestamp: true,
+        instanceId: true,
+        source: true,
+        MessageUpdate: {
+          select: {
+            status: true,
+          },
+        },
+      },
+    });
+
+    return {
+      messages: {
+        total: count,
+        pages: Math.ceil(count / query.offset),
+        currentPage: query.page,
+        records: messages,
+      },
+    };
   }
 
-  public async fetchStatusMessage(query: MessageUpQuery) {
-    this.logger.verbose('Fetching status messages');
-    if (query?.where) {
-      if (query.where?.remoteJid) {
-        query.where.remoteJid = this.createJid(query.where.remoteJid);
-      }
-      query.where.owner = this.instance.name;
-    } else {
-      query = {
-        where: {
-          owner: this.instance.name,
-        },
-        limit: query?.limit,
-      };
-    }
-    return await this.repository.messageUpdate.find(query);
+  public async fetchStatusMessage(query: any) {
+    return await this.prismaRepository.messageUpdate.findMany({
+      where: {
+        instanceId: this.instanceId,
+        remoteJid: query.where?.remoteJid,
+        messageId: query.where?.id,
+      },
+      skip: query.offset * (query?.page === 1 ? 0 : (query?.page as number) - 1),
+      take: query.offset,
+    });
   }
 
   public async fetchChats() {
-    this.logger.verbose('Fetching chats');
-    return await this.repository.chat.find({ where: { owner: this.instance.name } });
+    return await this.prismaRepository.chat.findMany({
+      where: { instanceId: this.instanceId },
+    });
   }
 }

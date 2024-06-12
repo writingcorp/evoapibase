@@ -1,24 +1,23 @@
+import { JsonValue } from '@prisma/client/runtime/library';
 import { delay } from '@whiskeysockets/baileys';
-import { isURL } from 'class-validator';
+import { isArray, isURL } from 'class-validator';
 import EventEmitter2 from 'eventemitter2';
 import { v4 } from 'uuid';
 
-import { Auth, ConfigService, HttpServer, WaBusiness } from '../../config/env.config';
+import { Auth, Chatwoot, ConfigService, HttpServer, WaBusiness } from '../../config/env.config';
 import { Logger } from '../../config/logger.config';
 import { BadRequestException, InternalServerErrorException, UnauthorizedException } from '../../exceptions';
 import { InstanceDto, SetPresenceDto } from '../dto/instance.dto';
 import { ChatwootService } from '../integrations/chatwoot/services/chatwoot.service';
 import { RabbitmqService } from '../integrations/rabbitmq/services/rabbitmq.service';
 import { SqsService } from '../integrations/sqs/services/sqs.service';
-import { TypebotService } from '../integrations/typebot/services/typebot.service';
 import { WebsocketService } from '../integrations/websocket/services/websocket.service';
 import { ProviderFiles } from '../provider/sessions';
-import { RepositoryBroker } from '../repository/repository.manager';
-import { AuthService, OldToken } from '../services/auth.service';
+import { PrismaRepository } from '../repository/repository.service';
+import { AuthService } from '../services/auth.service';
 import { CacheService } from '../services/cache.service';
 import { BaileysStartupService } from '../services/channels/whatsapp.baileys.service';
 import { BusinessStartupService } from '../services/channels/whatsapp.business.service';
-import { IntegrationService } from '../services/integration.service';
 import { WAMonitoringService } from '../services/monitor.service';
 import { SettingsService } from '../services/settings.service';
 import { WebhookService } from '../services/webhook.service';
@@ -29,7 +28,7 @@ export class InstanceController {
   constructor(
     private readonly waMonitor: WAMonitoringService,
     private readonly configService: ConfigService,
-    private readonly repository: RepositoryBroker,
+    private readonly prismaRepository: PrismaRepository,
     private readonly eventEmitter: EventEmitter2,
     private readonly authService: AuthService,
     private readonly webhookService: WebhookService,
@@ -38,8 +37,6 @@ export class InstanceController {
     private readonly websocketService: WebsocketService,
     private readonly rabbitmqService: RabbitmqService,
     private readonly sqsService: SqsService,
-    private readonly typebotService: TypebotService,
-    private readonly integrationService: IntegrationService,
     private readonly proxyService: ProxyController,
     private readonly cache: CacheService,
     private readonly chatwootCache: CacheService,
@@ -51,65 +48,59 @@ export class InstanceController {
 
   public async createInstance({
     instanceName,
-    webhook,
-    webhook_by_events,
-    webhook_base64,
-    events,
     qrcode,
     number,
-    mobile,
     integration,
     token,
-    chatwoot_account_id,
-    chatwoot_token,
-    chatwoot_url,
-    chatwoot_sign_msg,
-    chatwoot_reopen_conversation,
-    chatwoot_conversation_pending,
-    chatwoot_import_contacts,
-    chatwoot_name_inbox,
-    chatwoot_merge_brazil_contacts,
-    chatwoot_import_messages,
-    chatwoot_days_limit_import_messages,
-    reject_call,
-    msg_call,
-    groups_ignore,
-    always_online,
-    read_messages,
-    read_status,
-    sync_full_history,
-    websocket_enabled,
-    websocket_events,
-    rabbitmq_enabled,
-    rabbitmq_events,
-    sqs_enabled,
-    sqs_events,
-    typebot_url,
-    typebot,
-    typebot_expire,
-    typebot_keyword_finish,
-    typebot_delay_message,
-    typebot_unknown_message,
-    typebot_listening_from_me,
-    proxy,
+    rejectCall,
+    msgCall,
+    groupsIgnore,
+    alwaysOnline,
+    readMessages,
+    readStatus,
+    syncFullHistory,
+    proxyHost,
+    proxyPort,
+    proxyProtocol,
+    proxyUsername,
+    proxyPassword,
+    webhookUrl,
+    webhookByEvents,
+    webhookBase64,
+    webhookEvents,
+    websocketEnabled,
+    websocketEvents,
+    rabbitmqEnabled,
+    rabbitmqEvents,
+    sqsEnabled,
+    sqsEvents,
+    chatwootAccountId,
+    chatwootToken,
+    chatwootUrl,
+    chatwootSignMsg,
+    chatwootReopenConversation,
+    chatwootConversationPending,
+    chatwootImportContacts,
+    chatwootNameInbox,
+    chatwootMergeBrazilContacts,
+    chatwootImportMessages,
+    chatwootDaysLimitImportMessages,
+    chatwootOrganization,
+    chatwootLogo,
   }: InstanceDto) {
     try {
-      this.logger.verbose('requested createInstance from ' + instanceName + ' instance');
-
-      this.logger.verbose('checking duplicate token');
       await this.authService.checkDuplicateToken(token);
 
       if (!token && integration === Integration.WHATSAPP_BUSINESS) {
         throw new BadRequestException('token is required');
       }
 
-      this.logger.verbose('creating instance');
       let instance: BaileysStartupService | BusinessStartupService;
       if (integration === Integration.WHATSAPP_BUSINESS) {
         instance = new BusinessStartupService(
           this.configService,
           this.eventEmitter,
-          this.repository,
+          this.prismaRepository,
           this.cache,
           this.chatwootCache,
           this.baileysCache,
@@ -119,7 +110,7 @@ export class InstanceController {
         instance = new BaileysStartupService(
           this.configService,
           this.eventEmitter,
-          this.repository,
+          this.prismaRepository,
           this.cache,
           this.chatwootCache,
           this.baileysCache,
@@ -127,49 +118,47 @@ export class InstanceController {
         );
       }
 
-      await this.waMonitor.saveInstance({ integration, instanceName, token, number, mobile });
-
-      instance.instanceName = instanceName;
-
       const instanceId = v4();
+
+      let hash: string;
+
+      if (!token) hash = v4().toUpperCase();
+      else hash = token;
+
+      await this.waMonitor.saveInstance({ instanceId, integration, instanceName, hash, number });
+
+      instance.setInstance({
+        instanceName,
+        instanceId,
+        integration,
+        token: hash,
+        number,
+      });
 
       instance.sendDataWebhook(Events.INSTANCE_CREATE, {
         instanceName,
         instanceId: instanceId,
       });
 
-      this.logger.verbose('instance: ' + instance.instanceName + ' created');
-
       this.waMonitor.waInstances[instance.instanceName] = instance;
       this.waMonitor.delInstanceTime(instance.instanceName);
 
-      this.logger.verbose('generating hash');
-      const hash = await this.authService.generateHash(
-        {
-          instanceName: instance.instanceName,
-          instanceId: instanceId,
-        },
-        token,
-      );
+      let getWebhookEvents: string[];
 
-      this.logger.verbose('hash: ' + hash + ' generated');
-
-      let webhookEvents: string[];
-
-      if (webhook) {
-        if (!isURL(webhook, { require_tld: false })) {
+      if (webhookUrl) {
+        if (!isURL(webhookUrl, { require_tld: false })) {
           throw new BadRequestException('Invalid "url" property in webhook');
         }
 
-        this.logger.verbose('creating webhook');
         try {
           let newEvents: string[] = [];
-          if (events.length === 0) {
+          if (webhookEvents.length === 0) {
             newEvents = [
               'APPLICATION_STARTUP',
               'QRCODE_UPDATED',
               'MESSAGES_SET',
               'MESSAGES_UPSERT',
+              'MESSAGES_EDITED',
               'MESSAGES_UPDATE',
               'MESSAGES_DELETE',
               'SEND_MESSAGE',
@@ -188,40 +177,40 @@ export class InstanceController {
               'LABELS_EDIT',
               'LABELS_ASSOCIATION',
               'CALL',
-              'NEW_JWT_TOKEN',
               'TYPEBOT_START',
               'TYPEBOT_CHANGE_STATUS',
-              'CHAMA_AI_ACTION',
             ];
           } else {
-            newEvents = events;
+            newEvents = webhookEvents;
           }
           this.webhookService.create(instance, {
             enabled: true,
-            url: webhook,
+            url: webhookUrl,
             events: newEvents,
-            webhook_by_events,
-            webhook_base64,
+            webhookByEvents,
+            webhookBase64,
           });
 
-          webhookEvents = (await this.webhookService.find(instance)).events;
+          const webhookEventsJson: JsonValue = (await this.webhookService.find(instance)).events;
+
+          getWebhookEvents = Array.isArray(webhookEventsJson) ? webhookEventsJson.map((event) => String(event)) : [];
         } catch (error) {
           this.logger.log(error);
         }
       }
 
-      let websocketEvents: string[];
+      let getWebsocketEvents: string[];
 
-      if (websocket_enabled) {
-        this.logger.verbose('creating websocket');
+      if (websocketEnabled) {
         try {
           let newEvents: string[] = [];
-          if (websocket_events.length === 0) {
+          if (websocketEvents.length === 0) {
             newEvents = [
               'APPLICATION_STARTUP',
               'QRCODE_UPDATED',
               'MESSAGES_SET',
               'MESSAGES_UPSERT',
+              'MESSAGES_EDITED',
               'MESSAGES_UPDATE',
               'MESSAGES_DELETE',
               'SEND_MESSAGE',
@@ -240,37 +229,39 @@ export class InstanceController {
               'LABELS_EDIT',
               'LABELS_ASSOCIATION',
               'CALL',
-              'NEW_JWT_TOKEN',
               'TYPEBOT_START',
               'TYPEBOT_CHANGE_STATUS',
-              'CHAMA_AI_ACTION',
             ];
           } else {
-            newEvents = websocket_events;
+            newEvents = websocketEvents;
           }
           this.websocketService.create(instance, {
             enabled: true,
             events: newEvents,
           });
 
-          websocketEvents = (await this.websocketService.find(instance)).events;
+          const websocketEventsJson: JsonValue = (await this.websocketService.find(instance)).events;
+
+          getWebsocketEvents = Array.isArray(websocketEventsJson)
+            ? websocketEventsJson.map((event) => String(event))
+            : [];
         } catch (error) {
           this.logger.log(error);
         }
       }
 
-      let rabbitmqEvents: string[];
+      let getRabbitmqEvents: string[];
 
-      if (rabbitmq_enabled) {
-        this.logger.verbose('creating rabbitmq');
+      if (rabbitmqEnabled) {
         try {
           let newEvents: string[] = [];
-          if (rabbitmq_events.length === 0) {
+          if (rabbitmqEvents.length === 0) {
             newEvents = [
               'APPLICATION_STARTUP',
               'QRCODE_UPDATED',
               'MESSAGES_SET',
               'MESSAGES_UPSERT',
+              'MESSAGES_EDITED',
               'MESSAGES_UPDATE',
               'MESSAGES_DELETE',
               'SEND_MESSAGE',
@@ -289,37 +280,37 @@ export class InstanceController {
               'LABELS_EDIT',
               'LABELS_ASSOCIATION',
               'CALL',
-              'NEW_JWT_TOKEN',
               'TYPEBOT_START',
               'TYPEBOT_CHANGE_STATUS',
-              'CHAMA_AI_ACTION',
             ];
           } else {
-            newEvents = rabbitmq_events;
+            newEvents = rabbitmqEvents;
           }
           this.rabbitmqService.create(instance, {
             enabled: true,
             events: newEvents,
           });
 
-          rabbitmqEvents = (await this.rabbitmqService.find(instance)).events;
+          const rabbitmqEventsJson: JsonValue = (await this.rabbitmqService.find(instance)).events;
+
+          getRabbitmqEvents = Array.isArray(rabbitmqEventsJson) ? rabbitmqEventsJson.map((event) => String(event)) : [];
         } catch (error) {
           this.logger.log(error);
         }
       }
 
-      let sqsEvents: string[];
+      let getSqsEvents: string[];
 
-      if (sqs_enabled) {
-        this.logger.verbose('creating sqs');
+      if (sqsEnabled) {
         try {
           let newEvents: string[] = [];
-          if (sqs_events.length === 0) {
+          if (sqsEvents.length === 0) {
             newEvents = [
               'APPLICATION_STARTUP',
               'QRCODE_UPDATED',
               'MESSAGES_SET',
               'MESSAGES_UPSERT',
+              'MESSAGES_EDITED',
               'MESSAGES_UPDATE',
               'MESSAGES_DELETE',
               'SEND_MESSAGE',
@@ -338,98 +329,78 @@ export class InstanceController {
               'LABELS_EDIT',
               'LABELS_ASSOCIATION',
               'CALL',
-              'NEW_JWT_TOKEN',
               'TYPEBOT_START',
               'TYPEBOT_CHANGE_STATUS',
-              'CHAMA_AI_ACTION',
             ];
           } else {
-            newEvents = sqs_events;
+            newEvents = sqsEvents;
           }
           this.sqsService.create(instance, {
             enabled: true,
             events: newEvents,
           });
 
-          sqsEvents = (await this.sqsService.find(instance)).events;
+          const sqsEventsJson: JsonValue = (await this.sqsService.find(instance)).events;
+
+          getSqsEvents = Array.isArray(sqsEventsJson) ? sqsEventsJson.map((event) => String(event)) : [];
+
+          // sqsEvents = (await this.sqsService.find(instance)).events;
         } catch (error) {
           this.logger.log(error);
         }
       }
 
-      if (proxy) {
-        const testProxy = await this.proxyService.testProxy(proxy);
+      if (proxyHost && proxyPort && proxyProtocol) {
+        const testProxy = await this.proxyService.testProxy({
+          host: proxyHost,
+          port: proxyPort,
+          protocol: proxyProtocol,
+          username: proxyUsername,
+          password: proxyPassword,
+        });
         if (!testProxy) {
           throw new BadRequestException('Invalid proxy');
         }
 
         await this.proxyService.createProxy(instance, {
           enabled: true,
-          proxy,
+          host: proxyHost,
+          port: proxyPort,
+          protocol: proxyProtocol,
+          username: proxyUsername,
+          password: proxyPassword,
         });
       }
 
-      if (typebot_url) {
-        try {
-          if (!isURL(typebot_url, { require_tld: false })) {
-            throw new BadRequestException('Invalid "url" property in typebot_url');
-          }
-
-          this.logger.verbose('creating typebot');
-
-          this.typebotService.create(instance, {
-            enabled: true,
-            url: typebot_url,
-            typebot: typebot,
-            expire: typebot_expire,
-            keyword_finish: typebot_keyword_finish,
-            delay_message: typebot_delay_message,
-            unknown_message: typebot_unknown_message,
-            listening_from_me: typebot_listening_from_me,
-          });
-        } catch (error) {
-          this.logger.log(error);
-        }
-      }
-
-      this.logger.verbose('creating settings');
       const settings: wa.LocalSettings = {
-        reject_call: reject_call || false,
-        msg_call: msg_call || '',
-        groups_ignore: groups_ignore || true,
-        always_online: always_online || false,
-        read_messages: read_messages || false,
-        read_status: read_status || false,
-        sync_full_history: sync_full_history ?? false,
+        rejectCall: rejectCall || false,
+        msgCall: msgCall || '',
+        groupsIgnore: groupsIgnore || true,
+        alwaysOnline: alwaysOnline || false,
+        readMessages: readMessages || false,
+        readStatus: readStatus || false,
+        syncFullHistory: syncFullHistory ?? false,
       };
 
-      this.logger.verbose('settings: ' + JSON.stringify(settings));
+      await this.settingsService.create(instance, settings);
 
-      this.settingsService.create(instance, settings);
-
-      let webhook_wa_business = null,
-        access_token_wa_business = '';
+      let webhookWaBusiness = null,
+        accessTokenWaBusiness = '';
 
       if (integration === Integration.WHATSAPP_BUSINESS) {
         if (!number) {
           throw new BadRequestException('number is required');
         }
         const urlServer = this.configService.get<HttpServer>('SERVER').URL;
-        webhook_wa_business = `${urlServer}/webhook/whatsapp/${encodeURIComponent(instance.instanceName)}`;
-        access_token_wa_business = this.configService.get<WaBusiness>('WA_BUSINESS').TOKEN_WEBHOOK;
+        webhookWaBusiness = `${urlServer}/webhook/whatsapp/${encodeURIComponent(instance.instanceName)}`;
+        accessTokenWaBusiness = this.configService.get<WaBusiness>('WA_BUSINESS').TOKEN_WEBHOOK;
       }
 
-      this.integrationService.create(instance, {
-        integration,
-        number,
-        token,
-      });
-      if (!chatwoot_account_id || !chatwoot_token || !chatwoot_url) {
+      if (!chatwootAccountId || !chatwootToken || !chatwootUrl) {
         let getQrcode: wa.QrCode;
 
-        if (qrcode) {
-          this.logger.verbose('creating qrcode');
-          await instance.connectToWhatsapp(number, mobile);
+        if (qrcode && integration === Integration.WHATSAPP_BAILEYS) {
+          await instance.connectToWhatsapp(number);
           await delay(5000);
           getQrcode = instance.qrCode;
         }
@@ -439,75 +410,65 @@ export class InstanceController {
             instanceName: instance.instanceName,
             instanceId: instanceId,
             integration: integration,
-            webhook_wa_business,
-            access_token_wa_business,
+            webhookWaBusiness,
+            accessTokenWaBusiness,
             status: 'created',
           },
           hash,
           webhook: {
-            webhook,
-            webhook_by_events,
-            webhook_base64,
-            events: webhookEvents,
+            webhookUrl,
+            webhookByEvents,
+            webhookBase64,
+            events: getWebhookEvents,
           },
           websocket: {
-            enabled: websocket_enabled,
-            events: websocketEvents,
+            enabled: websocketEnabled,
+            events: getWebsocketEvents,
           },
           rabbitmq: {
-            enabled: rabbitmq_enabled,
-            events: rabbitmqEvents,
+            enabled: rabbitmqEnabled,
+            events: getRabbitmqEvents,
           },
           sqs: {
-            enabled: sqs_enabled,
-            events: sqsEvents,
-          },
-          typebot: {
-            enabled: typebot_url ? true : false,
-            url: typebot_url,
-            typebot,
-            expire: typebot_expire,
-            keyword_finish: typebot_keyword_finish,
-            delay_message: typebot_delay_message,
-            unknown_message: typebot_unknown_message,
-            listening_from_me: typebot_listening_from_me,
+            enabled: sqsEnabled,
+            events: getSqsEvents,
           },
           settings,
           qrcode: getQrcode,
         };
 
-        this.logger.verbose('instance created');
-        this.logger.verbose(result);
-
         return result;
       }
 
-      if (!chatwoot_account_id) {
-        throw new BadRequestException('account_id is required');
+      if (!this.configService.get<Chatwoot>('CHATWOOT').ENABLED)
+        throw new BadRequestException('Chatwoot is not enabled');
+
+      if (!chatwootAccountId) {
+        throw new BadRequestException('accountId is required');
       }
 
-      if (!chatwoot_token) {
+      if (!chatwootToken) {
         throw new BadRequestException('token is required');
       }
 
-      if (!chatwoot_url) {
+      if (!chatwootUrl) {
         throw new BadRequestException('url is required');
       }
 
-      if (!isURL(chatwoot_url, { require_tld: false })) {
+      if (!isURL(chatwootUrl, { require_tld: false })) {
         throw new BadRequestException('Invalid "url" property in chatwoot');
       }
 
-      if (chatwoot_sign_msg !== true && chatwoot_sign_msg !== false) {
-        throw new BadRequestException('sign_msg is required');
+      if (chatwootSignMsg !== true && chatwootSignMsg !== false) {
+        throw new BadRequestException('signMsg is required');
       }
 
-      if (chatwoot_reopen_conversation !== true && chatwoot_reopen_conversation !== false) {
-        throw new BadRequestException('reopen_conversation is required');
+      if (chatwootReopenConversation !== true && chatwootReopenConversation !== false) {
+        throw new BadRequestException('reopenConversation is required');
       }
 
-      if (chatwoot_conversation_pending !== true && chatwoot_conversation_pending !== false) {
-        throw new BadRequestException('conversation_pending is required');
+      if (chatwootConversationPending !== true && chatwootConversationPending !== false) {
+        throw new BadRequestException('conversationPending is required');
       }
 
       const urlServer = this.configService.get<HttpServer>('SERVER').URL;
@@ -515,19 +476,21 @@ export class InstanceController {
       try {
         this.chatwootService.create(instance, {
           enabled: true,
-          account_id: chatwoot_account_id,
-          token: chatwoot_token,
-          url: chatwoot_url,
-          sign_msg: chatwoot_sign_msg || false,
-          name_inbox: chatwoot_name_inbox ?? instance.instanceName.split('-cwId-')[0],
+          accountId: chatwootAccountId,
+          token: chatwootToken,
+          url: chatwootUrl,
+          signMsg: chatwootSignMsg || false,
+          nameInbox: chatwootNameInbox ?? instance.instanceName.split('-cwId-')[0],
           number,
-          reopen_conversation: chatwoot_reopen_conversation || false,
-          conversation_pending: chatwoot_conversation_pending || false,
-          import_contacts: chatwoot_import_contacts ?? true,
-          merge_brazil_contacts: chatwoot_merge_brazil_contacts ?? false,
-          import_messages: chatwoot_import_messages ?? true,
-          days_limit_import_messages: chatwoot_days_limit_import_messages ?? 60,
-          auto_create: true,
+          reopenConversation: chatwootReopenConversation || false,
+          conversationPending: chatwootConversationPending || false,
+          importContacts: chatwootImportContacts ?? true,
+          mergeBrazilContacts: chatwootMergeBrazilContacts ?? false,
+          importMessages: chatwootImportMessages ?? true,
+          daysLimitImportMessages: chatwootDaysLimitImportMessages ?? 60,
+          organization: chatwootOrganization,
+          logo: chatwootLogo,
+          autoCreate: true,
         });
       } catch (error) {
         this.logger.log(error);
@@ -538,71 +501,57 @@ export class InstanceController {
           instanceName: instance.instanceName,
           instanceId: instanceId,
           integration: integration,
-          webhook_wa_business,
-          access_token_wa_business,
+          webhookWaBusiness,
+          accessTokenWaBusiness,
           status: 'created',
         },
         hash,
         webhook: {
-          webhook,
-          webhook_by_events,
-          webhook_base64,
-          events: webhookEvents,
+          webhookUrl,
+          webhookByEvents,
+          webhookBase64,
+          events: getWebhookEvents,
         },
         websocket: {
-          enabled: websocket_enabled,
-          events: websocketEvents,
+          enabled: websocketEnabled,
+          events: getWebsocketEvents,
         },
         rabbitmq: {
-          enabled: rabbitmq_enabled,
-          events: rabbitmqEvents,
+          enabled: rabbitmqEnabled,
+          events: getRabbitmqEvents,
         },
         sqs: {
-          enabled: sqs_enabled,
-          events: sqsEvents,
-        },
-        typebot: {
-          enabled: typebot_url ? true : false,
-          url: typebot_url,
-          typebot,
-          expire: typebot_expire,
-          keyword_finish: typebot_keyword_finish,
-          delay_message: typebot_delay_message,
-          unknown_message: typebot_unknown_message,
-          listening_from_me: typebot_listening_from_me,
+          enabled: sqsEnabled,
+          events: getSqsEvents,
         },
         settings,
         chatwoot: {
           enabled: true,
-          account_id: chatwoot_account_id,
-          token: chatwoot_token,
-          url: chatwoot_url,
-          sign_msg: chatwoot_sign_msg || false,
-          reopen_conversation: chatwoot_reopen_conversation || false,
-          conversation_pending: chatwoot_conversation_pending || false,
-          merge_brazil_contacts: chatwoot_merge_brazil_contacts ?? false,
-          import_contacts: chatwoot_import_contacts ?? true,
-          import_messages: chatwoot_import_messages ?? true,
-          days_limit_import_messages: chatwoot_days_limit_import_messages || 60,
+          accountId: chatwootAccountId,
+          token: chatwootToken,
+          url: chatwootUrl,
+          signMsg: chatwootSignMsg || false,
+          reopenConversation: chatwootReopenConversation || false,
+          conversationPending: chatwootConversationPending || false,
+          mergeBrazilContacts: chatwootMergeBrazilContacts ?? false,
+          importContacts: chatwootImportContacts ?? true,
+          importMessages: chatwootImportMessages ?? true,
+          daysLimitImportMessages: chatwootDaysLimitImportMessages || 60,
           number,
-          name_inbox: chatwoot_name_inbox ?? instance.instanceName,
-          webhook_url: `${urlServer}/chatwoot/webhook/${encodeURIComponent(instance.instanceName)}`,
+          nameInbox: chatwootNameInbox ?? instance.instanceName,
+          webhookUrl: `${urlServer}/chatwoot/webhook/${encodeURIComponent(instance.instanceName)}`,
         },
       };
     } catch (error) {
-      this.logger.error(error.message[0]);
-      throw new BadRequestException(error.message[0]);
+      this.logger.error(isArray(error.message) ? error.message[0] : error.message);
+      throw new BadRequestException(isArray(error.message) ? error.message[0] : error.message);
     }
   }
 
-  public async connectToWhatsapp({ instanceName, number = null, mobile = null }: InstanceDto) {
+  public async connectToWhatsapp({ instanceName, number = null }: InstanceDto) {
     try {
-      this.logger.verbose('requested connectToWhatsapp from ' + instanceName + ' instance');
-
       const instance = this.waMonitor.waInstances[instanceName];
       const state = instance?.connectionStatus?.state;
-
-      this.logger.verbose('state: ' + state);
 
       if (!state) {
         throw new BadRequestException('The "' + instanceName + '" instance does not exist');
@@ -617,8 +566,7 @@ export class InstanceController {
       }
 
       if (state == 'close') {
-        this.logger.verbose('connecting');
-        await instance.connectToWhatsapp(number, mobile);
+        await instance.connectToWhatsapp(number);
 
         await delay(5000);
         return instance.qrCode;
@@ -638,15 +586,12 @@ export class InstanceController {
 
   public async restartInstance({ instanceName }: InstanceDto) {
     try {
-      this.logger.verbose('requested restartInstance from ' + instanceName + ' instance');
-
       const instance = this.waMonitor.waInstances[instanceName];
       const state = instance?.connectionStatus?.state;
 
       switch (state) {
         case 'open':
-          this.logger.verbose('logging out instance: ' + instanceName);
-          instance.clearCacheChatwoot();
+          if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) instance.clearCacheChatwoot();
           await instance.reloadConnection();
           await delay(2000);
 
@@ -659,22 +604,7 @@ export class InstanceController {
     }
   }
 
-  public async registerMobileCode({ instanceName }: InstanceDto, { mobileCode }: any) {
-    try {
-      this.logger.verbose('requested registerMobileCode from ' + instanceName + ' instance');
-
-      const instance = this.waMonitor.waInstances[instanceName];
-
-      console.log('mobileCode', mobileCode);
-      await instance.receiveMobileCode(mobileCode);
-      return { status: 'SUCCESS', error: false, response: { message: 'Mobile code registered' } };
-    } catch (error) {
-      this.logger.error(error);
-    }
-  }
-
   public async connectionState({ instanceName }: InstanceDto) {
-    this.logger.verbose('requested connectionState from ' + instanceName + ' instance');
     return {
       instance: {
         instanceName: instanceName,
@@ -687,37 +617,37 @@ export class InstanceController {
     const env = this.configService.get<Auth>('AUTHENTICATION').API_KEY;
 
     let name = instanceName;
-    let arrayReturn = false;
+    // let arrayReturn = false;
 
     if (env.KEY !== key) {
-      const instanceByKey = await this.repository.auth.findByKey(key);
+      const instanceByKey = await this.prismaRepository.instance.findUnique({
+        where: {
+          token: key,
+        },
+      });
+
       if (instanceByKey) {
-        name = instanceByKey._id;
-        arrayReturn = true;
+        name = instanceByKey.name;
+        // arrayReturn = true;
       } else {
         throw new UnauthorizedException();
       }
     }
 
     if (name) {
-      this.logger.verbose('requested fetchInstances from ' + name + ' instance');
-      this.logger.verbose('instanceName: ' + name);
-      return this.waMonitor.instanceInfo(name, arrayReturn);
+      return this.waMonitor.instanceInfo(name);
     } else if (instanceId || number) {
       return this.waMonitor.instanceInfoById(instanceId, number);
     }
 
-    this.logger.verbose('requested fetchInstances (all instances)');
     return this.waMonitor.instanceInfo();
   }
 
   public async setPresence({ instanceName }: InstanceDto, data: SetPresenceDto) {
-    this.logger.verbose('requested sendPresence from ' + instanceName + ' instance');
     return await this.waMonitor.waInstances[instanceName].setPresence(data);
   }
 
   public async logout({ instanceName }: InstanceDto) {
-    this.logger.verbose('requested logout from ' + instanceName + ' instance');
     const { instance } = await this.connectionState({ instanceName });
 
     if (instance.state === 'close') {
@@ -734,28 +664,24 @@ export class InstanceController {
   }
 
   public async deleteInstance({ instanceName }: InstanceDto) {
-    this.logger.verbose('requested deleteInstance from ' + instanceName + ' instance');
     const { instance } = await this.connectionState({ instanceName });
 
     if (instance.state === 'open') {
       throw new BadRequestException('The "' + instanceName + '" instance needs to be disconnected');
     }
     try {
-      this.waMonitor.waInstances[instanceName]?.removeRabbitmqQueues();
-      this.waMonitor.waInstances[instanceName]?.clearCacheChatwoot();
+      const waInstances = this.waMonitor.waInstances[instanceName];
+      waInstances?.removeRabbitmqQueues();
+      if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) waInstances?.clearCacheChatwoot();
 
       if (instance.state === 'connecting') {
-        this.logger.verbose('logging out instance: ' + instanceName);
-
         await this.logout({ instanceName });
       }
 
-      this.logger.verbose('deleting instance: ' + instanceName);
-
       try {
-        this.waMonitor.waInstances[instanceName]?.sendDataWebhook(Events.INSTANCE_DELETE, {
+        waInstances?.sendDataWebhook(Events.INSTANCE_DELETE, {
           instanceName,
-          instanceId: (await this.repository.auth.find(instanceName))?.instanceId,
+          instanceId: waInstances.instanceId,
         });
       } catch (error) {
         this.logger.error(error);
@@ -767,10 +693,5 @@ export class InstanceController {
     } catch (error) {
       throw new BadRequestException(error.toString());
     }
-  }
-
-  public async refreshToken(_: InstanceDto, oldToken: OldToken) {
-    this.logger.verbose('requested refreshToken');
-    return await this.authService.refreshToken(oldToken);
   }
 }

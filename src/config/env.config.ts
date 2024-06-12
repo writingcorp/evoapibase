@@ -1,7 +1,7 @@
 import { isBooleanString } from 'class-validator';
-import { readFileSync } from 'fs';
-import { load } from 'js-yaml';
-import { join } from 'path';
+import dotenv from 'dotenv';
+
+dotenv.config();
 
 export type HttpServer = {
   TYPE: 'http' | 'https';
@@ -44,29 +44,14 @@ export type SaveData = {
   LABELS: boolean;
 };
 
-export type StoreConf = {
-  MESSAGES: boolean;
-  MESSAGE_UP: boolean;
-  CONTACTS: boolean;
-  CHATS: boolean;
-  LABELS: boolean;
-};
-
-export type CleanStoreConf = {
-  CLEANING_INTERVAL: number;
-  MESSAGES: boolean;
-  MESSAGE_UP: boolean;
-  CONTACTS: boolean;
-  CHATS: boolean;
-};
-
 export type DBConnection = {
   URI: string;
-  DB_PREFIX_NAME: string;
+  CLIENT_NAME: string;
 };
 export type Database = {
   CONNECTION: DBConnection;
   ENABLED: boolean;
+  PROVIDER: string;
   SAVE_DATA: SaveData;
 };
 
@@ -77,6 +62,7 @@ export type EventsRabbitmq = {
   QRCODE_UPDATED: boolean;
   MESSAGES_SET: boolean;
   MESSAGES_UPSERT: boolean;
+  MESSAGES_EDITED: boolean;
   MESSAGES_UPDATE: boolean;
   MESSAGES_DELETE: boolean;
   SEND_MESSAGE: boolean;
@@ -95,7 +81,6 @@ export type EventsRabbitmq = {
   GROUP_UPDATE: boolean;
   GROUP_PARTICIPANTS_UPDATE: boolean;
   CALL: boolean;
-  NEW_JWT_TOKEN: boolean;
   TYPEBOT_START: boolean;
   TYPEBOT_CHANGE_STATUS: boolean;
 };
@@ -135,6 +120,7 @@ export type EventsWebhook = {
   QRCODE_UPDATED: boolean;
   MESSAGES_SET: boolean;
   MESSAGES_UPSERT: boolean;
+  MESSAGES_EDITED: boolean;
   MESSAGES_UPDATE: boolean;
   MESSAGES_DELETE: boolean;
   SEND_MESSAGE: boolean;
@@ -153,22 +139,17 @@ export type EventsWebhook = {
   GROUP_UPDATE: boolean;
   GROUP_PARTICIPANTS_UPDATE: boolean;
   CALL: boolean;
-  NEW_JWT_TOKEN: boolean;
   TYPEBOT_START: boolean;
   TYPEBOT_CHANGE_STATUS: boolean;
-  CHAMA_AI_ACTION: boolean;
   ERRORS: boolean;
   ERRORS_WEBHOOK: string;
 };
 
 export type ApiKey = { KEY: string };
-export type Jwt = { EXPIRIN_IN: number; SECRET: string };
 
 export type Auth = {
   API_KEY: ApiKey;
   EXPOSE_IN_FETCH_INSTANCES: boolean;
-  JWT: Jwt;
-  TYPE: 'jwt' | 'apikey';
 };
 
 export type DelInstance = number | boolean;
@@ -195,8 +176,9 @@ export type SslConf = { PRIVKEY: string; FULLCHAIN: string };
 export type Webhook = { GLOBAL?: GlobalWebhook; EVENTS: EventsWebhook };
 export type ConfigSessionPhone = { CLIENT: string; NAME: string; VERSION: string };
 export type QrCode = { LIMIT: number; COLOR: string };
-export type Typebot = { API_VERSION: string; KEEP_OPEN: boolean };
+export type Typebot = { ENABLED: boolean; API_VERSION: string; SEND_MEDIA_BASE64: boolean };
 export type Chatwoot = {
+  ENABLED: boolean;
   MESSAGE_DELETE: boolean;
   MESSAGE_READ: boolean;
   IMPORT: {
@@ -217,8 +199,6 @@ export interface Env {
   CORS: Cors;
   SSL_CONF: SslConf;
   PROVIDER: ProviderSession;
-  STORE: StoreConf;
-  CLEAN_STORE: CleanStoreConf;
   DATABASE: Database;
   RABBITMQ: Rabbitmq;
   SQS: Sqs;
@@ -252,16 +232,12 @@ export class ConfigService {
   }
 
   private loadEnv() {
-    this.env = !(process.env?.DOCKER_ENV === 'true') ? this.envYaml() : this.envProcess();
+    this.env = this.envProcess();
     this.env.PRODUCTION = process.env?.NODE_ENV === 'PROD';
     if (process.env?.DOCKER_ENV === 'true') {
       this.env.SERVER.TYPE = process.env.SERVER_TYPE as 'http' | 'http';
       this.env.SERVER.PORT = Number.parseInt(process.env.SERVER_PORT) || 8080;
     }
-  }
-
-  private envYaml(): Env {
-    return load(readFileSync(join(process.cwd(), 'src', 'env.yml'), { encoding: 'utf-8' })) as Env;
   }
 
   private envProcess(): Env {
@@ -288,28 +264,13 @@ export class ConfigService {
         PORT: process.env?.PROVIDER_PORT || '5656',
         PREFIX: process.env?.PROVIDER_PREFIX || 'evolution',
       },
-      STORE: {
-        MESSAGES: process.env?.STORE_MESSAGES === 'true',
-        MESSAGE_UP: process.env?.STORE_MESSAGE_UP === 'true',
-        CONTACTS: process.env?.STORE_CONTACTS === 'true',
-        CHATS: process.env?.STORE_CHATS === 'true',
-        LABELS: process.env?.STORE_LABELS === 'true',
-      },
-      CLEAN_STORE: {
-        CLEANING_INTERVAL: Number.isInteger(process.env?.CLEAN_STORE_CLEANING_INTERVAL)
-          ? Number.parseInt(process.env.CLEAN_STORE_CLEANING_INTERVAL)
-          : 7200,
-        MESSAGES: process.env?.CLEAN_STORE_MESSAGES === 'true',
-        MESSAGE_UP: process.env?.CLEAN_STORE_MESSAGE_UP === 'true',
-        CONTACTS: process.env?.CLEAN_STORE_CONTACTS === 'true',
-        CHATS: process.env?.CLEAN_STORE_CHATS === 'true',
-      },
       DATABASE: {
         CONNECTION: {
           URI: process.env.DATABASE_CONNECTION_URI || '',
-          DB_PREFIX_NAME: process.env.DATABASE_CONNECTION_DB_PREFIX_NAME || 'evolution',
+          CLIENT_NAME: process.env.DATABASE_CONNECTION_CLIENT_NAME || 'evolution',
         },
         ENABLED: process.env?.DATABASE_ENABLED === 'true',
+        PROVIDER: process.env.DATABASE_PROVIDER || 'postgresql',
         SAVE_DATA: {
           INSTANCE: process.env?.DATABASE_SAVE_DATA_INSTANCE === 'true',
           NEW_MESSAGE: process.env?.DATABASE_SAVE_DATA_NEW_MESSAGE === 'true',
@@ -331,6 +292,7 @@ export class ConfigService {
           QRCODE_UPDATED: process.env?.RABBITMQ_EVENTS_QRCODE_UPDATED === 'true',
           MESSAGES_SET: process.env?.RABBITMQ_EVENTS_MESSAGES_SET === 'true',
           MESSAGES_UPSERT: process.env?.RABBITMQ_EVENTS_MESSAGES_UPSERT === 'true',
+          MESSAGES_EDITED: process.env?.RABBITMQ_EVENTS_MESSAGES_EDITED === 'true',
           MESSAGES_UPDATE: process.env?.RABBITMQ_EVENTS_MESSAGES_UPDATE === 'true',
           MESSAGES_DELETE: process.env?.RABBITMQ_EVENTS_MESSAGES_DELETE === 'true',
           SEND_MESSAGE: process.env?.RABBITMQ_EVENTS_SEND_MESSAGE === 'true',
@@ -349,7 +311,6 @@ export class ConfigService {
           GROUP_UPDATE: process.env?.RABBITMQ_EVENTS_GROUPS_UPDATE === 'true',
           GROUP_PARTICIPANTS_UPDATE: process.env?.RABBITMQ_EVENTS_GROUP_PARTICIPANTS_UPDATE === 'true',
           CALL: process.env?.RABBITMQ_EVENTS_CALL === 'true',
-          NEW_JWT_TOKEN: process.env?.RABBITMQ_EVENTS_NEW_JWT_TOKEN === 'true',
           TYPEBOT_START: process.env?.RABBITMQ_EVENTS_TYPEBOT_START === 'true',
           TYPEBOT_CHANGE_STATUS: process.env?.RABBITMQ_EVENTS_TYPEBOT_CHANGE_STATUS === 'true',
         },
@@ -405,6 +366,7 @@ export class ConfigService {
           QRCODE_UPDATED: process.env?.WEBHOOK_EVENTS_QRCODE_UPDATED === 'true',
           MESSAGES_SET: process.env?.WEBHOOK_EVENTS_MESSAGES_SET === 'true',
           MESSAGES_UPSERT: process.env?.WEBHOOK_EVENTS_MESSAGES_UPSERT === 'true',
+          MESSAGES_EDITED: process.env?.WEBHOOK_EVENTS_MESSAGES_EDITED === 'true',
           MESSAGES_UPDATE: process.env?.WEBHOOK_EVENTS_MESSAGES_UPDATE === 'true',
           MESSAGES_DELETE: process.env?.WEBHOOK_EVENTS_MESSAGES_DELETE === 'true',
           SEND_MESSAGE: process.env?.WEBHOOK_EVENTS_SEND_MESSAGE === 'true',
@@ -423,10 +385,8 @@ export class ConfigService {
           GROUP_UPDATE: process.env?.WEBHOOK_EVENTS_GROUPS_UPDATE === 'true',
           GROUP_PARTICIPANTS_UPDATE: process.env?.WEBHOOK_EVENTS_GROUP_PARTICIPANTS_UPDATE === 'true',
           CALL: process.env?.WEBHOOK_EVENTS_CALL === 'true',
-          NEW_JWT_TOKEN: process.env?.WEBHOOK_EVENTS_NEW_JWT_TOKEN === 'true',
           TYPEBOT_START: process.env?.WEBHOOK_EVENTS_TYPEBOT_START === 'true',
           TYPEBOT_CHANGE_STATUS: process.env?.WEBHOOK_EVENTS_TYPEBOT_CHANGE_STATUS === 'true',
-          CHAMA_AI_ACTION: process.env?.WEBHOOK_EVENTS_CHAMA_AI_ACTION === 'true',
           ERRORS: process.env?.WEBHOOK_EVENTS_ERRORS === 'true',
           ERRORS_WEBHOOK: process.env?.WEBHOOK_EVENTS_ERRORS_WEBHOOK || '',
         },
@@ -441,12 +401,14 @@ export class ConfigService {
         COLOR: process.env.QRCODE_COLOR || '#198754',
       },
       TYPEBOT: {
+        ENABLED: process.env?.TYPEBOT_ENABLED === 'true',
         API_VERSION: process.env?.TYPEBOT_API_VERSION || 'old',
-        KEEP_OPEN: process.env.TYPEBOT_KEEP_OPEN === 'true',
+        SEND_MEDIA_BASE64: process.env?.TYPEBOT_SEND_MEDIA_BASE64 === 'true',
       },
       CHATWOOT: {
-        MESSAGE_DELETE: process.env.CHATWOOT_MESSAGE_DELETE === 'false',
-        MESSAGE_READ: process.env.CHATWOOT_MESSAGE_READ === 'false',
+        ENABLED: process.env?.CHATWOOT_ENABLED === 'true',
+        MESSAGE_DELETE: process.env.CHATWOOT_MESSAGE_DELETE === 'true',
+        MESSAGE_READ: process.env.CHATWOOT_MESSAGE_READ === 'true',
         IMPORT: {
           DATABASE: {
             CONNECTION: {
@@ -470,17 +432,10 @@ export class ConfigService {
         },
       },
       AUTHENTICATION: {
-        TYPE: process.env.AUTHENTICATION_TYPE as 'apikey',
         API_KEY: {
           KEY: process.env.AUTHENTICATION_API_KEY || 'BQYHJGJHJ',
         },
         EXPOSE_IN_FETCH_INSTANCES: process.env?.AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES === 'true',
-        JWT: {
-          EXPIRIN_IN: Number.isInteger(process.env?.AUTHENTICATION_JWT_EXPIRIN_IN)
-            ? Number.parseInt(process.env.AUTHENTICATION_JWT_EXPIRIN_IN)
-            : 3600,
-          SECRET: process.env.AUTHENTICATION_JWT_SECRET || 'L=0YWt]b2w[WF>#>:&E`',
-        },
       },
     };
   }

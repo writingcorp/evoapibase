@@ -1,28 +1,26 @@
-import { Logger } from '../../../../config/logger.config';
+import { configService, Rabbitmq } from '../../../../config/env.config';
+import { BadRequestException } from '../../../../exceptions';
 import { InstanceDto } from '../../../dto/instance.dto';
 import { RabbitmqDto } from '../dto/rabbitmq.dto';
 import { RabbitmqService } from '../services/rabbitmq.service';
-
-const logger = new Logger('RabbitmqController');
 
 export class RabbitmqController {
   constructor(private readonly rabbitmqService: RabbitmqService) {}
 
   public async createRabbitmq(instance: InstanceDto, data: RabbitmqDto) {
-    logger.verbose('requested createRabbitmq from ' + instance.instanceName + ' instance');
+    if (!configService.get<Rabbitmq>('RABBITMQ').ENABLED) throw new BadRequestException('Rabbitmq is disabled');
 
     if (!data.enabled) {
-      logger.verbose('rabbitmq disabled');
       data.events = [];
     }
 
     if (data.events.length === 0) {
-      logger.verbose('rabbitmq events empty');
       data.events = [
         'APPLICATION_STARTUP',
         'QRCODE_UPDATED',
         'MESSAGES_SET',
         'MESSAGES_UPSERT',
+        'MESSAGES_EDITED',
         'MESSAGES_UPDATE',
         'MESSAGES_DELETE',
         'SEND_MESSAGE',
@@ -41,10 +39,8 @@ export class RabbitmqController {
         'LABELS_EDIT',
         'LABELS_ASSOCIATION',
         'CALL',
-        'NEW_JWT_TOKEN',
         'TYPEBOT_START',
         'TYPEBOT_CHANGE_STATUS',
-        'CHAMA_AI_ACTION',
       ];
     }
 
@@ -52,7 +48,6 @@ export class RabbitmqController {
   }
 
   public async findRabbitmq(instance: InstanceDto) {
-    logger.verbose('requested findRabbitmq from ' + instance.instanceName + ' instance');
     return this.rabbitmqService.find(instance);
   }
 }

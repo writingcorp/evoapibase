@@ -10,13 +10,13 @@ import { initAMQP, initGlobalQueues } from './api/integrations/rabbitmq/libs/amq
 import { initSQS } from './api/integrations/sqs/libs/sqs.server';
 import { initIO } from './api/integrations/websocket/libs/socket.server';
 import { ProviderFiles } from './api/provider/sessions';
+import { PrismaRepository } from './api/repository/repository.service';
 import { HttpStatus, router } from './api/routes/index.router';
 import { waMonitor } from './api/server.module';
-import { Auth, configService, Cors, HttpServer, Rabbitmq, Sqs, Webhook } from './config/env.config';
+import { Auth, configService, Cors, HttpServer, ProviderSession, Rabbitmq, Sqs, Webhook } from './config/env.config';
 import { onUnexpectedError } from './config/error.config';
 import { Logger } from './config/logger.config';
 import { ROOT_DIR } from './config/path.config';
-import { swaggerRouter } from './docs/swagger.conf';
 import { ServerUP } from './utils/server-up';
 
 function initWA() {
@@ -27,9 +27,15 @@ async function bootstrap() {
   const logger = new Logger('SERVER');
   const app = express();
 
-  const providerFiles = new ProviderFiles(configService);
-  await providerFiles.onModuleInit();
-  logger.info('Provider:Files - ON');
+  let providerFiles: ProviderFiles = null;
+  if (configService.get<ProviderSession>('PROVIDER').ENABLED) {
+    providerFiles = new ProviderFiles(configService);
+    await providerFiles.onModuleInit();
+    logger.info('Provider:Files - ON');
+  }
+
+  const prismaRepository = new PrismaRepository(configService);
+  await prismaRepository.onModuleInit();
 
   app.use(
     cors({
@@ -58,8 +64,6 @@ async function bootstrap() {
   app.use('/store', express.static(join(ROOT_DIR, 'store')));
 
   app.use('/', router);
-
-  if (!configService.get('SERVER').DISABLE_DOCS) app.use(swaggerRouter);
 
   app.use(
     (err: Error, req: Request, res: Response, next: NextFunction) => {

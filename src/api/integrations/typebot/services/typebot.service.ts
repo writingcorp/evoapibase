@@ -1,156 +1,534 @@
+import { Message, Typebot as TypebotModel, TypebotSession } from '@prisma/client';
 import axios from 'axios';
-import EventEmitter2 from 'eventemitter2';
 
 import { ConfigService, Typebot } from '../../../../config/env.config';
 import { Logger } from '../../../../config/logger.config';
 import { InstanceDto } from '../../../dto/instance.dto';
-import { MessageRaw } from '../../../models';
+import { PrismaRepository } from '../../../repository/repository.service';
 import { WAMonitoringService } from '../../../services/monitor.service';
 import { Events } from '../../../types/wa.types';
-import { Session, TypebotDto } from '../dto/typebot.dto';
+import { TypebotDto } from '../dto/typebot.dto';
 
 export class TypebotService {
   constructor(
     private readonly waMonitor: WAMonitoringService,
     private readonly configService: ConfigService,
-    private readonly eventEmitter: EventEmitter2,
-  ) {
-    this.eventEmitter.on('typebot:end', async (data) => {
-      const keep_open = this.configService.get<Typebot>('TYPEBOT').KEEP_OPEN;
-      if (keep_open) return;
+    private readonly prismaRepository: PrismaRepository,
+  ) {}
 
-      await this.clearSessions(data.instance, data.remoteJid);
-    });
-  }
+  private userMessageDebounce: { [key: string]: { message: string; timeoutId: NodeJS.Timeout } } = {};
 
   private readonly logger = new Logger(TypebotService.name);
 
-  public create(instance: InstanceDto, data: TypebotDto) {
-    this.logger.verbose('create typebot: ' + instance.instanceName);
-    this.waMonitor.waInstances[instance.instanceName].setTypebot(data);
+  public async create(instance: InstanceDto, data: TypebotDto) {
+    const instanceId = await this.prismaRepository.instance
+      .findFirst({
+        where: {
+          name: instance.instanceName,
+        },
+      })
+      .then((instance) => instance.id);
 
-    return { typebot: { ...instance, typebot: data } };
+    if (
+      !data.expire ||
+      !data.keywordFinish ||
+      !data.delayMessage ||
+      !data.unknownMessage ||
+      !data.listeningFromMe ||
+      !data.stopBotFromMe ||
+      !data.keepOpen ||
+      !data.debounceTime
+    ) {
+      const defaultSettingCheck = await this.prismaRepository.typebotSetting.findFirst({
+        where: {
+          instanceId: instanceId,
+        },
+      });
+
+      if (!defaultSettingCheck) {
+        throw new Error('Default settings not found');
+      }
+
+      if (!data.expire) data.expire = defaultSettingCheck.expire;
+      if (!data.keywordFinish) data.keywordFinish = defaultSettingCheck.keywordFinish;
+      if (!data.delayMessage) data.delayMessage = defaultSettingCheck.delayMessage;
+      if (!data.unknownMessage) data.unknownMessage = defaultSettingCheck.unknownMessage;
+      if (!data.listeningFromMe) data.listeningFromMe = defaultSettingCheck.listeningFromMe;
+      if (!data.stopBotFromMe) data.stopBotFromMe = defaultSettingCheck.stopBotFromMe;
+      if (!data.keepOpen) data.keepOpen = defaultSettingCheck.keepOpen;
+      if (!data.debounceTime) data.debounceTime = defaultSettingCheck.debounceTime;
+    }
+
+    const checkTriggerAll = await this.prismaRepository.typebot.findFirst({
+      where: {
+        enabled: true,
+        triggerType: 'all',
+      },
+    });
+
+    if (checkTriggerAll && data.triggerType === 'all') {
+      throw new Error('You already have a typebot with an "All" trigger, you cannot have more bots while it is active');
+    }
+
+    const checkDuplicate = await this.prismaRepository.typebot.findFirst({
+      where: {
+        url: data.url,
+        typebot: data.typebot,
+      },
+    });
+
+    if (checkDuplicate) {
+      throw new Error('Typebot already exists');
+    }
+
+    if (data.triggerType !== 'all') {
+      if (!data.triggerOperator || !data.triggerValue) {
+        throw new Error('Trigger operator and value are required');
+      }
+
+      const checkDuplicate = await this.prismaRepository.typebot.findFirst({
+        where: {
+          triggerOperator: data.triggerOperator,
+          triggerValue: data.triggerValue,
+        },
+      });
+
+      if (checkDuplicate) {
+        throw new Error('Trigger already exists');
+      }
+    }
+
+    try {
+      const typebot = await this.prismaRepository.typebot.create({
+        data: {
+          enabled: data.enabled,
+          url: data.url,
+          typebot: data.typebot,
+          expire: data.expire,
+          keywordFinish: data.keywordFinish,
+          delayMessage: data.delayMessage,
+          unknownMessage: data.unknownMessage,
+          listeningFromMe: data.listeningFromMe,
+          stopBotFromMe: data.stopBotFromMe,
+          keepOpen: data.keepOpen,
+          debounceTime: data.debounceTime,
+          instanceId: instanceId,
+          triggerType: data.triggerType,
+          triggerOperator: data.triggerOperator,
+          triggerValue: data.triggerValue,
+        },
+      });
+
+      return typebot;
+    } catch (error) {
+      this.logger.error(error);
+      throw new Error('Error creating typebot');
+    }
   }
 
-  public async find(instance: InstanceDto): Promise<TypebotDto> {
-    try {
-      this.logger.verbose('find typebot: ' + instance.instanceName);
-      const result = await this.waMonitor.waInstances[instance.instanceName].findTypebot();
+  public async fetch(instance: InstanceDto, typebotId: string) {
+    const instanceId = await this.prismaRepository.instance
+      .findFirst({
+        where: {
+          name: instance.instanceName,
+        },
+      })
+      .then((instance) => instance.id);
 
-      if (Object.keys(result).length === 0) {
+    const typebot = await this.prismaRepository.typebot.findFirst({
+      where: {
+        id: typebotId,
+      },
+      include: {
+        sessions: true,
+      },
+    });
+
+    if (!typebot) {
+      throw new Error('Typebot not found');
+    }
+
+    if (typebot.instanceId !== instanceId) {
+      throw new Error('Typebot not found');
+    }
+
+    return typebot;
+  }
+
+  public async update(instance: InstanceDto, typebotId: string, data: any) {
+    const instanceId = await this.prismaRepository.instance
+      .findFirst({
+        where: {
+          name: instance.instanceName,
+        },
+      })
+      .then((instance) => instance.id);
+
+    const typebot = await this.prismaRepository.typebot.findFirst({
+      where: {
+        id: typebotId,
+      },
+    });
+
+    if (!typebot) {
+      throw new Error('Typebot not found');
+    }
+
+    if (typebot.instanceId !== instanceId) {
+      throw new Error('Typebot not found');
+    }
+
+    if (data.triggerType === 'all') {
+      const checkTriggerAll = await this.prismaRepository.typebot.findFirst({
+        where: {
+          enabled: true,
+          triggerType: 'all',
+          id: {
+            not: typebotId,
+          },
+        },
+      });
+
+      if (checkTriggerAll) {
+        throw new Error(
+          'You already have a typebot with an "All" trigger, you cannot have more bots while it is active',
+        );
+      }
+    }
+
+    const checkDuplicate = await this.prismaRepository.typebot.findFirst({
+      where: {
+        url: data.url,
+        typebot: data.typebot,
+        id: {
+          not: typebotId,
+        },
+      },
+    });
+
+    if (checkDuplicate) {
+      throw new Error('Typebot already exists');
+    }
+
+    if (data.triggerType !== 'all') {
+      if (!data.triggerOperator || !data.triggerValue) {
+        throw new Error('Trigger operator and value are required');
+      }
+
+      const checkDuplicate = await this.prismaRepository.typebot.findFirst({
+        where: {
+          triggerOperator: data.triggerOperator,
+          triggerValue: data.triggerValue,
+          id: {
+            not: typebotId,
+          },
+        },
+      });
+
+      if (checkDuplicate) {
+        throw new Error('Trigger already exists');
+      }
+
+      try {
+        const typebot = await this.prismaRepository.typebot.update({
+          where: {
+            id: typebotId,
+          },
+          data: {
+            enabled: data.enabled,
+            url: data.url,
+            typebot: data.typebot,
+            expire: data.expire,
+            keywordFinish: data.keywordFinish,
+            delayMessage: data.delayMessage,
+            unknownMessage: data.unknownMessage,
+            listeningFromMe: data.listeningFromMe,
+            stopBotFromMe: data.stopBotFromMe,
+            keepOpen: data.keepOpen,
+            debounceTime: data.debounceTime,
+            triggerType: data.triggerType,
+            triggerOperator: data.triggerOperator,
+            triggerValue: data.triggerValue,
+          },
+        });
+
+        return typebot;
+      } catch (error) {
+        this.logger.error(error);
+        throw new Error('Error updating typebot');
+      }
+    }
+  }
+
+  public async find(instance: InstanceDto): Promise<any> {
+    const instanceId = await this.prismaRepository.instance
+      .findFirst({
+        where: {
+          name: instance.instanceName,
+        },
+      })
+      .then((instance) => instance.id);
+
+    const typebots = await this.prismaRepository.typebot.findMany({
+      where: {
+        instanceId: instanceId,
+      },
+      include: {
+        sessions: true,
+      },
+    });
+
+    if (!typebots.length) {
+      this.logger.error('Typebot not found');
+      return null;
+    }
+
+    return typebots;
+  }
+
+  public async delete(instance: InstanceDto, typebotId: string) {
+    const instanceId = await this.prismaRepository.instance
+      .findFirst({
+        where: {
+          name: instance.instanceName,
+        },
+      })
+      .then((instance) => instance.id);
+
+    const typebot = await this.prismaRepository.typebot.findFirst({
+      where: {
+        id: typebotId,
+      },
+    });
+
+    if (!typebot) {
+      throw new Error('Typebot not found');
+    }
+
+    if (typebot.instanceId !== instanceId) {
+      throw new Error('Typebot not found');
+    }
+    try {
+      await this.prismaRepository.typebotSession.deleteMany({
+        where: {
+          typebotId: typebotId,
+        },
+      });
+
+      await this.prismaRepository.typebot.delete({
+        where: {
+          id: typebotId,
+        },
+      });
+
+      return { typebot: { id: typebotId } };
+    } catch (error) {
+      this.logger.error(error);
+      throw new Error('Error deleting typebot');
+    }
+  }
+
+  public async setDefaultSettings(instance: InstanceDto, data: any) {
+    try {
+      const instanceId = await this.prismaRepository.instance
+        .findFirst({
+          where: {
+            name: instance.instanceName,
+          },
+        })
+        .then((instance) => instance.id);
+
+      const settings = await this.prismaRepository.typebotSetting.findFirst({
+        where: {
+          instanceId: instanceId,
+        },
+      });
+
+      if (settings) {
+        const updateSettings = await this.prismaRepository.typebotSetting.update({
+          where: {
+            id: settings.id,
+          },
+          data: {
+            expire: data.expire,
+            keywordFinish: data.keywordFinish,
+            delayMessage: data.delayMessage,
+            unknownMessage: data.unknownMessage,
+            listeningFromMe: data.listeningFromMe,
+            stopBotFromMe: data.stopBotFromMe,
+            keepOpen: data.keepOpen,
+            debounceTime: data.debounceTime,
+          },
+        });
+
+        return {
+          expire: updateSettings.expire,
+          keywordFinish: updateSettings.keywordFinish,
+          delayMessage: updateSettings.delayMessage,
+          unknownMessage: updateSettings.unknownMessage,
+          listeningFromMe: updateSettings.listeningFromMe,
+          stopBotFromMe: updateSettings.stopBotFromMe,
+          keepOpen: updateSettings.keepOpen,
+          debounceTime: updateSettings.debounceTime,
+        };
+      }
+
+      const newSetttings = await this.prismaRepository.typebotSetting.create({
+        data: {
+          expire: data.expire,
+          keywordFinish: data.keywordFinish,
+          delayMessage: data.delayMessage,
+          unknownMessage: data.unknownMessage,
+          listeningFromMe: data.listeningFromMe,
+          stopBotFromMe: data.stopBotFromMe,
+          keepOpen: data.keepOpen,
+          debounceTime: data.debounceTime,
+          instanceId: instanceId,
+        },
+      });
+
+      return {
+        expire: newSetttings.expire,
+        keywordFinish: newSetttings.keywordFinish,
+        delayMessage: newSetttings.delayMessage,
+        unknownMessage: newSetttings.unknownMessage,
+        listeningFromMe: newSetttings.listeningFromMe,
+        stopBotFromMe: newSetttings.stopBotFromMe,
+        keepOpen: newSetttings.keepOpen,
+        debounceTime: newSetttings.debounceTime,
+      };
+    } catch (error) {
+      this.logger.error(error);
+      throw new Error('Error setting default settings');
+    }
+  }
+
+  public async fetchDefaultSettings(instance: InstanceDto) {
+    try {
+      const instanceId = await this.prismaRepository.instance
+        .findFirst({
+          where: {
+            name: instance.instanceName,
+          },
+        })
+        .then((instance) => instance.id);
+
+      const settings = await this.prismaRepository.typebotSetting.findFirst({
+        where: {
+          instanceId: instanceId,
+        },
+      });
+
+      if (!settings) {
+        throw new Error('Default settings not found');
+      }
+
+      return {
+        expire: settings.expire,
+        keywordFinish: settings.keywordFinish,
+        delayMessage: settings.delayMessage,
+        unknownMessage: settings.unknownMessage,
+        listeningFromMe: settings.listeningFromMe,
+        stopBotFromMe: settings.stopBotFromMe,
+        keepOpen: settings.keepOpen,
+      };
+    } catch (error) {
+      this.logger.error(error);
+      throw new Error('Error fetching default settings');
+    }
+  }
+
+  public async fetchSessions(instance: InstanceDto, typebotId?: string, remoteJid?: string) {
+    try {
+      const instanceId = await this.prismaRepository.instance
+        .findFirst({
+          where: {
+            name: instance.instanceName,
+          },
+        })
+        .then((instance) => instance.id);
+
+      const typebot = await this.prismaRepository.typebot.findFirst({
+        where: {
+          id: typebotId,
+        },
+      });
+
+      if (!typebot) {
         throw new Error('Typebot not found');
       }
 
-      return result;
+      if (typebot.instanceId !== instanceId) {
+        throw new Error('Typebot not found');
+      }
+
+      if (typebotId) {
+        return await this.prismaRepository.typebotSession.findMany({
+          where: {
+            typebotId: typebotId,
+          },
+        });
+      }
+
+      if (remoteJid) {
+        return await this.prismaRepository.typebotSession.findMany({
+          where: {
+            remoteJid: remoteJid,
+          },
+        });
+      }
     } catch (error) {
-      return { enabled: false, url: '', typebot: '', expire: 0, sessions: [] };
+      this.logger.error(error);
+      throw new Error('Error fetching sessions');
     }
   }
 
   public async changeStatus(instance: InstanceDto, data: any) {
-    const remoteJid = data.remoteJid;
-    const status = data.status;
+    try {
+      const instanceId = await this.prismaRepository.instance
+        .findFirst({
+          where: {
+            name: instance.instanceName,
+          },
+        })
+        .then((instance) => instance.id);
 
-    const findData = await this.find(instance);
+      const remoteJid = data.remoteJid;
+      const status = data.status;
 
-    const session = findData.sessions.find((session) => session.remoteJid === remoteJid);
-
-    if (session) {
       if (status === 'closed') {
-        findData.sessions.splice(findData.sessions.indexOf(session), 1);
+        await this.prismaRepository.typebotSession.deleteMany({
+          where: {
+            remoteJid: remoteJid,
+          },
+        });
+
+        return { typebot: { ...instance, typebot: { remoteJid: remoteJid, status: status } } };
+      } else {
+        const session = await this.prismaRepository.typebotSession.updateMany({
+          where: {
+            instanceId: instanceId,
+            remoteJid: remoteJid,
+          },
+          data: {
+            status: status,
+          },
+        });
 
         const typebotData = {
-          enabled: findData.enabled,
-          url: findData.url,
-          typebot: findData.typebot,
-          expire: findData.expire,
-          keyword_finish: findData.keyword_finish,
-          delay_message: findData.delay_message,
-          unknown_message: findData.unknown_message,
-          listening_from_me: findData.listening_from_me,
-          sessions: findData.sessions,
+          remoteJid: remoteJid,
+          status: status,
+          session,
         };
 
-        this.create(instance, typebotData);
+        this.waMonitor.waInstances[instance.instanceName].sendDataWebhook(Events.TYPEBOT_CHANGE_STATUS, typebotData);
 
         return { typebot: { ...instance, typebot: typebotData } };
       }
-
-      findData.sessions.map((session) => {
-        if (session.remoteJid === remoteJid) {
-          session.status = status;
-        }
-      });
-    } else if (status === 'paused') {
-      const session: Session = {
-        remoteJid: remoteJid,
-        sessionId: Math.floor(Math.random() * 10000000000).toString(),
-        status: status,
-        createdAt: Date.now(),
-        updateAt: Date.now(),
-        prefilledVariables: {
-          remoteJid: remoteJid,
-          pushName: '',
-          additionalData: {},
-        },
-      };
-      findData.sessions.push(session);
+    } catch (error) {
+      this.logger.error(error);
+      throw new Error('Error changing status');
     }
-
-    const typebotData = {
-      enabled: findData.enabled,
-      url: findData.url,
-      typebot: findData.typebot,
-      expire: findData.expire,
-      keyword_finish: findData.keyword_finish,
-      delay_message: findData.delay_message,
-      unknown_message: findData.unknown_message,
-      listening_from_me: findData.listening_from_me,
-      sessions: findData.sessions,
-    };
-
-    this.create(instance, typebotData);
-
-    this.waMonitor.waInstances[instance.instanceName].sendDataWebhook(Events.TYPEBOT_CHANGE_STATUS, {
-      remoteJid: remoteJid,
-      status: status,
-      url: findData.url,
-      typebot: findData.typebot,
-      session,
-    });
-
-    return { typebot: { ...instance, typebot: typebotData } };
-  }
-
-  public async clearSessions(instance: InstanceDto, remoteJid: string) {
-    const findTypebot = await this.find(instance);
-    const sessions = (findTypebot.sessions as Session[]) ?? [];
-
-    const sessionWithRemoteJid = sessions.filter((session) => session.remoteJid === remoteJid);
-
-    if (sessionWithRemoteJid.length > 0) {
-      sessionWithRemoteJid.forEach((session) => {
-        sessions.splice(sessions.indexOf(session), 1);
-      });
-
-      const typebotData = {
-        enabled: findTypebot.enabled,
-        url: findTypebot.url,
-        typebot: findTypebot.typebot,
-        expire: findTypebot.expire,
-        keyword_finish: findTypebot.keyword_finish,
-        delay_message: findTypebot.delay_message,
-        unknown_message: findTypebot.unknown_message,
-        listening_from_me: findTypebot.listening_from_me,
-        sessions,
-      };
-
-      this.create(instance, typebotData);
-
-      return sessions;
-    }
-
-    return sessions;
   }
 
   public async startTypebot(instance: InstanceDto, data: any) {
@@ -161,12 +539,52 @@ export class TypebotService {
     const typebot = data.typebot;
     const startSession = data.startSession;
     const variables = data.variables;
-    const findTypebot = await this.find(instance);
-    const expire = findTypebot.expire;
-    const keyword_finish = findTypebot.keyword_finish;
-    const delay_message = findTypebot.delay_message;
-    const unknown_message = findTypebot.unknown_message;
-    const listening_from_me = findTypebot.listening_from_me;
+    let expire = data?.typebot?.expire;
+    let keywordFinish = data?.typebot?.keywordFinish;
+    let delayMessage = data?.typebot?.delayMessage;
+    let unknownMessage = data?.typebot?.unknownMessage;
+    let listeningFromMe = data?.typebot?.listeningFromMe;
+    let stopBotFromMe = data?.typebot?.stopBotFromMe;
+    let keepOpen = data?.typebot?.keepOpen;
+
+    const findTypebot = await this.prismaRepository.typebot.findFirst({
+      where: {
+        url: url,
+        typebot: typebot,
+      },
+    });
+
+    if (!findTypebot) {
+      throw new Error('Typebot not found');
+    }
+
+    if (
+      !expire ||
+      !keywordFinish ||
+      !delayMessage ||
+      !unknownMessage ||
+      !listeningFromMe ||
+      !stopBotFromMe ||
+      !keepOpen
+    ) {
+      const defaultSettingCheck = await this.prismaRepository.typebotSetting.findFirst({
+        where: {
+          instanceId: instance.instanceId,
+        },
+      });
+
+      if (!defaultSettingCheck) {
+        throw new Error('Default settings not found');
+      }
+
+      if (!expire) expire = defaultSettingCheck.expire;
+      if (!keywordFinish) keywordFinish = defaultSettingCheck.keywordFinish;
+      if (!delayMessage) delayMessage = defaultSettingCheck.delayMessage;
+      if (!unknownMessage) unknownMessage = defaultSettingCheck.unknownMessage;
+      if (!listeningFromMe) listeningFromMe = defaultSettingCheck.listeningFromMe;
+      if (!stopBotFromMe) stopBotFromMe = defaultSettingCheck.stopBotFromMe;
+      if (!keepOpen) keepOpen = defaultSettingCheck.keepOpen;
+    }
 
     const prefilledVariables = {
       remoteJid: remoteJid,
@@ -180,24 +598,46 @@ export class TypebotService {
     }
 
     if (startSession) {
-      const newSessions = await this.clearSessions(instance, remoteJid);
+      await this.prismaRepository.typebotSession.deleteMany({
+        where: {
+          remoteJid: remoteJid,
+        },
+      });
 
       const response = await this.createNewSession(instance, {
-        enabled: findTypebot.enabled,
+        enabled: true,
         url: url,
         typebot: typebot,
         remoteJid: remoteJid,
         expire: expire,
-        keyword_finish: keyword_finish,
-        delay_message: delay_message,
-        unknown_message: unknown_message,
-        listening_from_me: listening_from_me,
-        sessions: newSessions,
+        keywordFinish: keywordFinish,
+        delayMessage: delayMessage,
+        unknownMessage: unknownMessage,
+        listeningFromMe: listeningFromMe,
+        stopBotFromMe: stopBotFromMe,
+        keepOpen: keepOpen,
         prefilledVariables: prefilledVariables,
+        typebotId: findTypebot.id,
       });
 
       if (response.sessionId) {
-        await this.sendWAMessage(instance, remoteJid, response.messages, response.input, response.clientSideActions);
+        await this.sendWAMessage(
+          instance,
+          response.session,
+          {
+            expire: expire,
+            keywordFinish: keywordFinish,
+            delayMessage: delayMessage,
+            unknownMessage: unknownMessage,
+            listeningFromMe: listeningFromMe,
+            stopBotFromMe: stopBotFromMe,
+            keepOpen: keepOpen,
+          },
+          remoteJid,
+          response.messages,
+          response.input,
+          response.clientSideActions,
+        );
 
         this.waMonitor.waInstances[instance.instanceName].sendDataWebhook(Events.TYPEBOT_START, {
           remoteJid: remoteJid,
@@ -236,6 +676,16 @@ export class TypebotService {
 
         await this.sendWAMessage(
           instance,
+          null,
+          {
+            expire: expire,
+            keywordFinish: keywordFinish,
+            delayMessage: delayMessage,
+            unknownMessage: unknownMessage,
+            listeningFromMe: listeningFromMe,
+            stopBotFromMe: stopBotFromMe,
+            keepOpen: keepOpen,
+          },
           remoteJid,
           request.data.messages,
           request.data.input,
@@ -269,148 +719,48 @@ export class TypebotService {
   }
 
   private getTypeMessage(msg: any) {
-    this.logger.verbose('get type message');
     const types = {
-      conversation: msg.conversation,
-      extendedTextMessage: msg.extendedTextMessage?.text,
-      audioMessage: msg.audioMessage?.url,
-      imageMessage: msg.imageMessage?.url,
-      videoMessage: msg.videoMessage?.url,
-      documentMessage: msg.documentMessage?.fileName,
-      contactMessage: msg.contactMessage?.displayName,
-      locationMessage: msg.locationMessage?.degreesLatitude,
+      conversation: msg?.message?.conversation,
+      extendedTextMessage: msg?.message?.extendedTextMessage?.text,
+      contactMessage: msg?.message?.contactMessage?.displayName,
+      locationMessage: msg?.message?.locationMessage?.degreesLatitude,
       viewOnceMessageV2:
-        msg.viewOnceMessageV2?.message?.imageMessage?.url ||
-        msg.viewOnceMessageV2?.message?.videoMessage?.url ||
-        msg.viewOnceMessageV2?.message?.audioMessage?.url,
-      listResponseMessage: msg.listResponseMessage?.singleSelectReply?.selectedRowId,
-      responseRowId: msg.listResponseMessage?.singleSelectReply?.selectedRowId,
+        msg?.message?.viewOnceMessageV2?.message?.imageMessage?.url ||
+        msg?.message?.viewOnceMessageV2?.message?.videoMessage?.url ||
+        msg?.message?.viewOnceMessageV2?.message?.audioMessage?.url,
+      listResponseMessage: msg?.message?.listResponseMessage?.singleSelectReply?.selectedRowId,
+      responseRowId: msg?.message?.listResponseMessage?.singleSelectReply?.selectedRowId,
+      // Medias
+      audioMessage: msg?.message?.audioMessage ? `audioMessage:${msg?.key?.id}` : undefined,
+      imageMessage: msg?.message?.imageMessage ? `imageMessage:${msg?.key?.id}` : undefined,
+      videoMessage: msg?.message?.videoMessage ? `videoMessage:${msg?.key?.id}` : undefined,
+      documentMessage: msg?.message?.documentMessage ? `documentMessage:${msg?.key?.id}` : undefined,
+      documentWithCaptionMessage: msg?.message?.auddocumentWithCaptionMessageioMessage
+        ? `documentWithCaptionMessage:${msg?.key?.id}`
+        : undefined,
     };
 
     const messageType = Object.keys(types).find((key) => types[key] !== undefined) || 'unknown';
 
-    this.logger.verbose('Type message: ' + JSON.stringify(types));
     return { ...types, messageType };
   }
 
   private getMessageContent(types: any) {
-    this.logger.verbose('get message content');
     const typeKey = Object.keys(types).find((key) => types[key] !== undefined);
 
     const result = typeKey ? types[typeKey] : undefined;
-
-    this.logger.verbose('message content: ' + result);
 
     return result;
   }
 
   private getConversationMessage(msg: any) {
-    this.logger.verbose('get conversation message');
-
     const types = this.getTypeMessage(msg);
 
     const messageContent = this.getMessageContent(types);
 
-    this.logger.verbose('conversation message: ' + messageContent);
-
     return messageContent;
   }
 
-  private getAudioMessageContent(msg: any) {
-    this.logger.verbose('get audio message content');
-
-    const types = this.getTypeMessage(msg);
-
-    const audioContent = types.audioMessage;
-
-    this.logger.verbose('audio message URL: ' + audioContent);
-
-    return audioContent;
-  }
-
-  private getImageMessageContent(msg: any) {
-    this.logger.verbose('get image message content');
-
-    const types = this.getTypeMessage(msg);
-
-    const imageContent = types.imageMessage;
-
-    this.logger.verbose('image message URL: ' + imageContent);
-
-    return imageContent;
-  }
-
-  private getVideoMessageContent(msg: any) {
-    this.logger.verbose('get video message content');
-
-    const types = this.getTypeMessage(msg);
-
-    const videoContent = types.videoMessage;
-
-    this.logger.verbose('video message URL: ' + videoContent);
-
-    return videoContent;
-  }
-
-  private getDocumentMessageContent(msg: any) {
-    this.logger.verbose('get document message content');
-
-    const types = this.getTypeMessage(msg);
-
-    const documentContent = types.documentMessage;
-
-    this.logger.verbose('document message fileName: ' + documentContent);
-
-    return documentContent;
-  }
-
-  private getContactMessageContent(msg: any) {
-    this.logger.verbose('get contact message content');
-
-    const types = this.getTypeMessage(msg);
-
-    const contactContent = types.contactMessage;
-
-    this.logger.verbose('contact message displayName: ' + contactContent);
-
-    return contactContent;
-  }
-
-  private getLocationMessageContent(msg: any) {
-    this.logger.verbose('get location message content');
-
-    const types = this.getTypeMessage(msg);
-
-    const locationContent = types.locationMessage;
-
-    this.logger.verbose('location message degreesLatitude: ' + locationContent);
-
-    return locationContent;
-  }
-
-  private getViewOnceMessageV2Content(msg: any) {
-    this.logger.verbose('get viewOnceMessageV2 content');
-
-    const types = this.getTypeMessage(msg);
-
-    const viewOnceContent = types.viewOnceMessageV2;
-
-    this.logger.verbose('viewOnceMessageV2 URL: ' + viewOnceContent);
-
-    return viewOnceContent;
-  }
-
-  private getListResponseMessageContent(msg: any) {
-    this.logger.verbose('get listResponseMessage content');
-
-    const types = this.getTypeMessage(msg);
-
-    const listResponseContent = types.listResponseMessage || types.responseRowId;
-
-    this.logger.verbose('listResponseMessage selectedRowId: ' + listResponseContent);
-
-    return listResponseContent;
-  }
   public async createNewSession(instance: InstanceDto, data: any) {
     if (data.remoteJid === 'status@broadcast') return;
     const id = Math.floor(Math.random() * 10000000000).toString();
@@ -447,36 +797,27 @@ export class TypebotService {
       }
       const request = await axios.post(url, reqData);
 
+      let session = null;
       if (request?.data?.sessionId) {
-        data.sessions.push({
-          remoteJid: data.remoteJid,
-          sessionId: `${id}-${request.data.sessionId}`,
-          status: 'opened',
-          createdAt: Date.now(),
-          updateAt: Date.now(),
-          prefilledVariables: {
-            ...data.prefilledVariables,
+        session = await this.prismaRepository.typebotSession.create({
+          data: {
             remoteJid: data.remoteJid,
             pushName: data.pushName || '',
-            instanceName: instance.instanceName,
+            sessionId: `${id}-${request.data.sessionId}`,
+            status: 'opened',
+            prefilledVariables: {
+              ...data.prefilledVariables,
+              remoteJid: data.remoteJid,
+              pushName: data.pushName || '',
+              instanceName: instance.instanceName,
+            },
+            awaitUser: false,
+            typebotId: data.typebotId,
+            instanceId: instance.instanceId,
           },
         });
-
-        const typebotData = {
-          enabled: data.enabled,
-          url: data.url,
-          typebot: data.typebot,
-          expire: data.expire,
-          keyword_finish: data.keyword_finish,
-          delay_message: data.delay_message,
-          unknown_message: data.unknown_message,
-          listening_from_me: data.listening_from_me,
-          sessions: data.sessions,
-        };
-
-        this.create(instance, typebotData);
       }
-      return request.data;
+      return { ...request.data, session };
     } catch (error) {
       this.logger.error(error);
       return;
@@ -485,18 +826,30 @@ export class TypebotService {
 
   public async sendWAMessage(
     instance: InstanceDto,
+    session: TypebotSession,
+    settings: {
+      expire: number;
+      keywordFinish: string;
+      delayMessage: number;
+      unknownMessage: string;
+      listeningFromMe: boolean;
+      stopBotFromMe: boolean;
+      keepOpen: boolean;
+    },
     remoteJid: string,
-    messages: any[],
-    input: any[],
-    clientSideActions: any[],
+    messages: any,
+    input: any,
+    clientSideActions: any,
   ) {
     processMessages(
       this.waMonitor.waInstances[instance.instanceName],
+      session,
+      settings,
       messages,
       input,
       clientSideActions,
-      this.eventEmitter,
       applyFormatting,
+      this.prismaRepository,
     ).catch((err) => {
       console.error('Erro ao processar mensagens:', err);
     });
@@ -572,7 +925,24 @@ export class TypebotService {
       return formattedText;
     }
 
-    async function processMessages(instance, messages, input, clientSideActions, eventEmitter, applyFormatting) {
+    async function processMessages(
+      instance: any,
+      session: TypebotSession,
+      settings: {
+        expire: number;
+        keywordFinish: string;
+        delayMessage: number;
+        unknownMessage: string;
+        listeningFromMe: boolean;
+        stopBotFromMe: boolean;
+        keepOpen: boolean;
+      },
+      messages: any,
+      input: any,
+      clientSideActions: any,
+      applyFormatting: any,
+      prismaRepository: PrismaRepository,
+    ) {
       for (const message of messages) {
         if (message.type === 'text') {
           let formattedText = '';
@@ -588,58 +958,50 @@ export class TypebotService {
 
           formattedText = formattedText.replace(/\n$/, '');
 
-          await instance.textMessage({
-            number: remoteJid.split('@')[0],
-            options: {
-              delay: instance.localTypebot.delay_message || 1000,
-              presence: 'composing',
-            },
-            textMessage: {
+          await instance.textMessage(
+            {
+              number: remoteJid.split('@')[0],
+              delay: settings?.delayMessage || 1000,
               text: formattedText,
             },
-          });
+            true,
+          );
         }
 
         if (message.type === 'image') {
-          await instance.mediaMessage({
-            number: remoteJid.split('@')[0],
-            options: {
-              delay: instance.localTypebot.delay_message || 1000,
-              presence: 'composing',
-            },
-            mediaMessage: {
+          await instance.mediaMessage(
+            {
+              number: remoteJid.split('@')[0],
+              delay: settings?.delayMessage || 1000,
               mediatype: 'image',
               media: message.content.url,
             },
-          });
+            true,
+          );
         }
 
         if (message.type === 'video') {
-          await instance.mediaMessage({
-            number: remoteJid.split('@')[0],
-            options: {
-              delay: instance.localTypebot.delay_message || 1000,
-              presence: 'composing',
-            },
-            mediaMessage: {
+          await instance.mediaMessage(
+            {
+              number: remoteJid.split('@')[0],
+              delay: settings?.delayMessage || 1000,
               mediatype: 'video',
               media: message.content.url,
             },
-          });
+            true,
+          );
         }
 
         if (message.type === 'audio') {
-          await instance.audioWhatsapp({
-            number: remoteJid.split('@')[0],
-            options: {
-              delay: instance.localTypebot.delay_message || 1000,
-              presence: 'recording',
+          await instance.audioWhatsapp(
+            {
+              number: remoteJid.split('@')[0],
+              delay: settings?.delayMessage || 1000,
               encoding: true,
-            },
-            audioMessage: {
               audio: message.content.url,
             },
-          });
+            true,
+          );
         }
 
         const wait = findItemAndGetSecondsToWait(clientSideActions, message.id);
@@ -661,206 +1023,387 @@ export class TypebotService {
 
           formattedText = formattedText.replace(/\n$/, '');
 
-          await instance.textMessage({
-            number: remoteJid.split('@')[0],
-            options: {
-              delay: instance.localTypebot.delay_message || 1000,
-              presence: 'composing',
-            },
-            textMessage: {
+          await instance.textMessage(
+            {
+              number: remoteJid.split('@')[0],
+              delay: settings?.delayMessage || 1000,
               text: formattedText,
+            },
+            true,
+          );
+        }
+
+        await prismaRepository.typebotSession.update({
+          where: {
+            id: session.id,
+          },
+          data: {
+            awaitUser: true,
+          },
+        });
+      } else {
+        if (!settings?.keepOpen) {
+          await prismaRepository.typebotSession.deleteMany({
+            where: {
+              id: session.id,
+            },
+          });
+        } else {
+          await prismaRepository.typebotSession.update({
+            where: {
+              id: session.id,
+            },
+            data: {
+              status: 'closed',
             },
           });
         }
-      } else {
-        eventEmitter.emit('typebot:end', {
-          instance: instance,
-          remoteJid: remoteJid,
-        });
       }
     }
   }
 
-  public async sendTypebot(instance: InstanceDto, remoteJid: string, msg: MessageRaw) {
-    const findTypebot = await this.find(instance);
-    const url = findTypebot.url;
-    const typebot = findTypebot.typebot;
-    const sessions = (findTypebot.sessions as Session[]) ?? [];
-    const expire = findTypebot.expire;
-    const keyword_finish = findTypebot.keyword_finish;
-    const delay_message = findTypebot.delay_message;
-    const unknown_message = findTypebot.unknown_message;
-    const listening_from_me = findTypebot.listening_from_me;
-    const messageType = this.getTypeMessage(msg.message).messageType;
+  public async findTypebotByTrigger(content: string) {
+    let typebot = null;
 
-    const session = sessions.find((session) => session.remoteJid === remoteJid);
+    const findTriggerAll = await this.prismaRepository.typebot.findFirst({
+      where: {
+        enabled: true,
+        triggerType: 'all',
+      },
+    });
 
-    try {
-      if (session && expire && expire > 0) {
-        const now = Date.now();
+    if (findTriggerAll) {
+      typebot = findTriggerAll;
+    } else {
+      const findTriggerEquals = await this.prismaRepository.typebot.findFirst({
+        where: {
+          enabled: true,
+          triggerType: 'keyword',
+          triggerOperator: 'equals',
+          triggerValue: content,
+        },
+      });
 
-        const diff = now - session.updateAt;
+      if (findTriggerEquals) {
+        typebot = findTriggerEquals;
+      } else {
+        const findTriggerStartsWith = await this.prismaRepository.typebot.findFirst({
+          where: {
+            enabled: true,
+            triggerType: 'keyword',
+            triggerOperator: 'startsWith',
+            triggerValue: { startsWith: content },
+          },
+        });
 
-        const diffInMinutes = Math.floor(diff / 1000 / 60);
-
-        if (diffInMinutes > expire) {
-          const newSessions = await this.clearSessions(instance, remoteJid);
-
-          const data = await this.createNewSession(instance, {
-            enabled: findTypebot.enabled,
-            url: url,
-            typebot: typebot,
-            expire: expire,
-            keyword_finish: keyword_finish,
-            delay_message: delay_message,
-            unknown_message: unknown_message,
-            listening_from_me: listening_from_me,
-            sessions: newSessions,
-            remoteJid: remoteJid,
-            pushName: msg.pushName,
+        if (findTriggerStartsWith) {
+          typebot = findTriggerStartsWith;
+        } else {
+          const findTriggerEndsWith = await this.prismaRepository.typebot.findFirst({
+            where: {
+              enabled: true,
+              triggerType: 'keyword',
+              triggerOperator: 'endsWith',
+              triggerValue: { endsWith: content },
+            },
           });
 
-          await this.sendWAMessage(instance, remoteJid, data.messages, data.input, data.clientSideActions);
+          if (findTriggerEndsWith) {
+            typebot = findTriggerEndsWith;
+          } else {
+            const findTriggerContains = await this.prismaRepository.typebot.findFirst({
+              where: {
+                enabled: true,
+                triggerType: 'keyword',
+                triggerOperator: 'contains',
+                triggerValue: { contains: content },
+              },
+            });
 
-          if (data.messages.length === 0) {
-            const content = this.getConversationMessage(msg.message);
-
-            if (!content) {
-              if (unknown_message) {
-                this.waMonitor.waInstances[instance.instanceName].textMessage({
-                  number: remoteJid.split('@')[0],
-                  options: {
-                    delay: delay_message || 1000,
-                    presence: 'composing',
-                  },
-                  textMessage: {
-                    text: unknown_message,
-                  },
-                });
-              }
-              return;
-            }
-
-            if (keyword_finish && content.toLowerCase() === keyword_finish.toLowerCase()) {
-              const newSessions = await this.clearSessions(instance, remoteJid);
-
-              const typebotData = {
-                enabled: findTypebot.enabled,
-                url: url,
-                typebot: typebot,
-                expire: expire,
-                keyword_finish: keyword_finish,
-                delay_message: delay_message,
-                unknown_message: unknown_message,
-                listening_from_me: listening_from_me,
-                sessions: newSessions,
-              };
-
-              this.create(instance, typebotData);
-
-              return;
-            }
-
-            try {
-              const version = this.configService.get<Typebot>('TYPEBOT').API_VERSION;
-              let urlTypebot: string;
-              let reqData: {};
-              if (version === 'latest') {
-                urlTypebot = `${url}/api/v1/sessions/${data.sessionId}/continueChat`;
-                reqData = {
-                  message: content,
-                };
-              } else {
-                urlTypebot = `${url}/api/v1/sendMessage`;
-                reqData = {
-                  message: content,
-                  sessionId: data.sessionId,
-                };
-              }
-
-              const request = await axios.post(urlTypebot, reqData);
-
-              await this.sendWAMessage(
-                instance,
-                remoteJid,
-                request.data.messages,
-                request.data.input,
-                request.data.clientSideActions,
-              );
-            } catch (error) {
-              this.logger.error(error);
-              return;
+            if (findTriggerContains) {
+              typebot = findTriggerContains;
             }
           }
-
-          return;
         }
       }
+    }
 
-      if (session && session.status !== 'opened') {
+    return typebot;
+  }
+
+  private processDebounce(content: string, remoteJid: string, debounceTime: number, callback: any) {
+    if (this.userMessageDebounce[remoteJid]) {
+      this.userMessageDebounce[remoteJid].message += ` ${content}`;
+      this.logger.log('message debounced: ' + this.userMessageDebounce[remoteJid].message);
+      clearTimeout(this.userMessageDebounce[remoteJid].timeoutId);
+    } else {
+      this.userMessageDebounce[remoteJid] = {
+        message: content,
+        timeoutId: null,
+      };
+    }
+
+    this.userMessageDebounce[remoteJid].timeoutId = setTimeout(() => {
+      const myQuestion = this.userMessageDebounce[remoteJid].message;
+      this.logger.log('Debounce complete. Processing message: ' + myQuestion);
+
+      delete this.userMessageDebounce[remoteJid];
+      callback(myQuestion);
+    }, debounceTime * 1000);
+  }
+
+  public async sendTypebot(instance: InstanceDto, remoteJid: string, msg: Message) {
+    try {
+      const session = await this.prismaRepository.typebotSession.findFirst({
+        where: {
+          remoteJid: remoteJid,
+        },
+      });
+
+      const content = this.getConversationMessage(msg);
+
+      let findTypebot = null;
+
+      if (!session) {
+        findTypebot = await this.findTypebotByTrigger(content);
+
+        if (!findTypebot) {
+          return;
+        }
+      } else {
+        findTypebot = await this.prismaRepository.typebot.findFirst({
+          where: {
+            id: session.typebotId,
+          },
+        });
+      }
+
+      const url = findTypebot?.url;
+      const typebot = findTypebot?.typebot;
+      let expire = findTypebot?.expire;
+      let keywordFinish = findTypebot?.keywordFinish;
+      let delayMessage = findTypebot?.delayMessage;
+      let unknownMessage = findTypebot?.unknownMessage;
+      let listeningFromMe = findTypebot?.listeningFromMe;
+      let stopBotFromMe = findTypebot?.stopBotFromMe;
+      let keepOpen = findTypebot?.keepOpen;
+      let debounceTime = findTypebot?.debounceTime;
+
+      if (
+        !expire ||
+        !keywordFinish ||
+        !delayMessage ||
+        !unknownMessage ||
+        !listeningFromMe ||
+        !stopBotFromMe ||
+        !keepOpen
+      ) {
+        const settings = await this.prismaRepository.typebotSetting.findFirst({
+          where: {
+            instanceId: instance.instanceId,
+          },
+        });
+
+        if (!expire) expire = settings.expire;
+
+        if (!keywordFinish) keywordFinish = settings.keywordFinish;
+
+        if (!delayMessage) delayMessage = settings.delayMessage;
+
+        if (!unknownMessage) unknownMessage = settings.unknownMessage;
+
+        if (!listeningFromMe) listeningFromMe = settings.listeningFromMe;
+
+        if (!stopBotFromMe) stopBotFromMe = settings.stopBotFromMe;
+
+        if (!keepOpen) keepOpen = settings.keepOpen;
+
+        if (!debounceTime) debounceTime = settings.debounceTime;
+      }
+
+      const key = msg.key as {
+        id: string;
+        remoteJid: string;
+        fromMe: boolean;
+        participant: string;
+      };
+
+      if (!listeningFromMe && key.fromMe) {
         return;
       }
 
-      if (!session) {
+      if (stopBotFromMe && listeningFromMe && key.fromMe && session) {
+        await this.prismaRepository.typebotSession.deleteMany({
+          where: {
+            typebotId: findTypebot.id,
+            remoteJid: remoteJid,
+          },
+        });
+        return;
+      }
+
+      if (debounceTime && debounceTime > 0) {
+        this.processDebounce(content, remoteJid, debounceTime, async (debouncedContent) => {
+          await this.processTypebot(
+            instance,
+            remoteJid,
+            msg,
+            session,
+            findTypebot,
+            url,
+            expire,
+            typebot,
+            keywordFinish,
+            delayMessage,
+            unknownMessage,
+            listeningFromMe,
+            stopBotFromMe,
+            keepOpen,
+            debouncedContent,
+          );
+        });
+      } else {
+        await this.processTypebot(
+          instance,
+          remoteJid,
+          msg,
+          session,
+          findTypebot,
+          url,
+          expire,
+          typebot,
+          keywordFinish,
+          delayMessage,
+          unknownMessage,
+          listeningFromMe,
+          stopBotFromMe,
+          keepOpen,
+          content,
+        );
+      }
+
+      // await this.processTypebot(
+      //   instance,
+      //   remoteJid,
+      //   msg,
+      //   session,
+      //   findTypebot,
+      //   url,
+      //   expire,
+      //   typebot,
+      //   keywordFinish,
+      //   delayMessage,
+      //   unknownMessage,
+      //   listeningFromMe,
+      //   stopBotFromMe,
+      //   keepOpen,
+      //   content,
+      // );
+
+      if (session && !session.awaitUser) return;
+    } catch (error) {
+      this.logger.error(error);
+      return;
+    }
+  }
+
+  private async processTypebot(
+    instance: InstanceDto,
+    remoteJid: string,
+    msg: Message,
+    session: TypebotSession,
+    findTypebot: TypebotModel,
+    url: string,
+    expire: number,
+    typebot: string,
+    keywordFinish: string,
+    delayMessage: number,
+    unknownMessage: string,
+    listeningFromMe: boolean,
+    stopBotFromMe: boolean,
+    keepOpen: boolean,
+    content: string,
+  ) {
+    if (session && expire && expire > 0) {
+      const now = Date.now();
+
+      const sessionUpdatedAt = new Date(session.updatedAt).getTime();
+
+      const diff = now - sessionUpdatedAt;
+
+      const diffInMinutes = Math.floor(diff / 1000 / 60);
+
+      if (diffInMinutes > expire) {
+        await this.prismaRepository.typebotSession.deleteMany({
+          where: {
+            typebotId: findTypebot.id,
+            remoteJid: remoteJid,
+          },
+        });
+
         const data = await this.createNewSession(instance, {
           enabled: findTypebot.enabled,
           url: url,
           typebot: typebot,
           expire: expire,
-          keyword_finish: keyword_finish,
-          delay_message: delay_message,
-          unknown_message: unknown_message,
-          listening_from_me: listening_from_me,
-          sessions: sessions,
+          keywordFinish: keywordFinish,
+          delayMessage: delayMessage,
+          unknownMessage: unknownMessage,
+          listeningFromMe: listeningFromMe,
           remoteJid: remoteJid,
           pushName: msg.pushName,
-          prefilledVariables: {
-            messageType: messageType,
-          },
+          typebotId: findTypebot.id,
         });
 
-        await this.sendWAMessage(instance, remoteJid, data.messages, data.input, data.clientSideActions);
+        if (data.session) {
+          session = data.session;
+        }
+
+        await this.sendWAMessage(
+          instance,
+          session,
+          {
+            expire: expire,
+            keywordFinish: keywordFinish,
+            delayMessage: delayMessage,
+            unknownMessage: unknownMessage,
+            listeningFromMe: listeningFromMe,
+            stopBotFromMe: stopBotFromMe,
+            keepOpen: keepOpen,
+          },
+          remoteJid,
+          data.messages,
+          data.input,
+          data.clientSideActions,
+        );
 
         if (data.messages.length === 0) {
           const content = this.getConversationMessage(msg.message);
 
           if (!content) {
-            if (unknown_message) {
-              this.waMonitor.waInstances[instance.instanceName].textMessage({
-                number: remoteJid.split('@')[0],
-                options: {
-                  delay: delay_message || 1000,
-                  presence: 'composing',
+            if (unknownMessage) {
+              this.waMonitor.waInstances[instance.instanceName].textMessage(
+                {
+                  number: remoteJid.split('@')[0],
+                  delay: delayMessage || 1000,
+                  text: unknownMessage,
                 },
-                textMessage: {
-                  text: unknown_message,
-                },
-              });
+                true,
+              );
             }
             return;
           }
 
-          if (keyword_finish && content.toLowerCase() === keyword_finish.toLowerCase()) {
-            const newSessions = await this.clearSessions(instance, remoteJid);
-
-            const typebotData = {
-              enabled: findTypebot.enabled,
-              url: url,
-              typebot: typebot,
-              expire: expire,
-              keyword_finish: keyword_finish,
-              delay_message: delay_message,
-              unknown_message: unknown_message,
-              listening_from_me: listening_from_me,
-              sessions: newSessions,
-            };
-
-            this.create(instance, typebotData);
-
+          if (keywordFinish && content.toLowerCase() === keywordFinish.toLowerCase()) {
+            await this.prismaRepository.typebotSession.deleteMany({
+              where: {
+                typebotId: findTypebot.id,
+                remoteJid: remoteJid,
+              },
+            });
             return;
           }
 
-          let request: any;
           try {
             const version = this.configService.get<Typebot>('TYPEBOT').API_VERSION;
             let urlTypebot: string;
@@ -877,10 +1420,21 @@ export class TypebotService {
                 sessionId: data.sessionId,
               };
             }
-            request = await axios.post(urlTypebot, reqData);
+
+            const request = await axios.post(urlTypebot, reqData);
 
             await this.sendWAMessage(
               instance,
+              session,
+              {
+                expire: expire,
+                keywordFinish: keywordFinish,
+                delayMessage: delayMessage,
+                unknownMessage: unknownMessage,
+                listeningFromMe: listeningFromMe,
+                stopBotFromMe: stopBotFromMe,
+                keepOpen: keepOpen,
+              },
               remoteJid,
               request.data.messages,
               request.data.input,
@@ -891,96 +1445,191 @@ export class TypebotService {
             return;
           }
         }
+
         return;
       }
+    }
 
-      sessions.map((session) => {
-        if (session.remoteJid === remoteJid) {
-          session.updateAt = Date.now();
-        }
-      });
+    if (session && session.status !== 'opened') {
+      return;
+    }
 
-      const typebotData = {
-        enabled: findTypebot.enabled,
+    if (!session) {
+      const data = await this.createNewSession(instance, {
+        enabled: findTypebot?.enabled,
         url: url,
         typebot: typebot,
         expire: expire,
-        keyword_finish: keyword_finish,
-        delay_message: delay_message,
-        unknown_message: unknown_message,
-        listening_from_me: listening_from_me,
-        sessions,
-      };
+        keywordFinish: keywordFinish,
+        delayMessage: delayMessage,
+        unknownMessage: unknownMessage,
+        listeningFromMe: listeningFromMe,
+        remoteJid: remoteJid,
+        pushName: msg.pushName,
+        typebotId: findTypebot.id,
+      });
 
-      this.create(instance, typebotData);
-
-      const content = this.getConversationMessage(msg.message);
-
-      if (!content) {
-        if (unknown_message) {
-          this.waMonitor.waInstances[instance.instanceName].textMessage({
-            number: remoteJid.split('@')[0],
-            options: {
-              delay: delay_message || 1000,
-              presence: 'composing',
-            },
-            textMessage: {
-              text: unknown_message,
-            },
-          });
-        }
-        return;
+      if (data.session) {
+        session = data.session;
       }
-
-      if (keyword_finish && content.toLowerCase() === keyword_finish.toLowerCase()) {
-        const newSessions = await this.clearSessions(instance, remoteJid);
-
-        const typebotData = {
-          enabled: findTypebot.enabled,
-          url: url,
-          typebot: typebot,
-          expire: expire,
-          keyword_finish: keyword_finish,
-          delay_message: delay_message,
-          unknown_message: unknown_message,
-          listening_from_me: listening_from_me,
-          sessions: newSessions,
-        };
-
-        this.create(instance, typebotData);
-
-        return;
-      }
-
-      const version = this.configService.get<Typebot>('TYPEBOT').API_VERSION;
-      let urlTypebot: string;
-      let reqData: {};
-      if (version === 'latest') {
-        urlTypebot = `${url}/api/v1/sessions/${session.sessionId.split('-')[1]}/continueChat`;
-        reqData = {
-          message: content,
-        };
-      } else {
-        urlTypebot = `${url}/api/v1/sendMessage`;
-        reqData = {
-          message: content,
-          sessionId: session.sessionId.split('-')[1],
-        };
-      }
-      const request = await axios.post(urlTypebot, reqData);
 
       await this.sendWAMessage(
         instance,
+        session,
+        {
+          expire: expire,
+          keywordFinish: keywordFinish,
+          delayMessage: delayMessage,
+          unknownMessage: unknownMessage,
+          listeningFromMe: listeningFromMe,
+          stopBotFromMe: stopBotFromMe,
+          keepOpen: keepOpen,
+        },
         remoteJid,
-        request.data.messages,
-        request.data.input,
-        request.data.clientSideActions,
+        data?.messages,
+        data?.input,
+        data?.clientSideActions,
       );
 
-      return;
-    } catch (error) {
-      this.logger.error(error);
+      if (data.messages.length === 0) {
+        if (!content) {
+          if (unknownMessage) {
+            this.waMonitor.waInstances[instance.instanceName].textMessage(
+              {
+                number: remoteJid.split('@')[0],
+                delay: delayMessage || 1000,
+                text: unknownMessage,
+              },
+              true,
+            );
+          }
+          return;
+        }
+
+        if (keywordFinish && content.toLowerCase() === keywordFinish.toLowerCase()) {
+          await this.prismaRepository.typebotSession.deleteMany({
+            where: {
+              typebotId: findTypebot.id,
+              remoteJid: remoteJid,
+            },
+          });
+
+          return;
+        }
+
+        let request: any;
+        try {
+          const version = this.configService.get<Typebot>('TYPEBOT').API_VERSION;
+          let urlTypebot: string;
+          let reqData: {};
+          if (version === 'latest') {
+            urlTypebot = `${url}/api/v1/sessions/${data.sessionId}/continueChat`;
+            reqData = {
+              message: content,
+            };
+          } else {
+            urlTypebot = `${url}/api/v1/sendMessage`;
+            reqData = {
+              message: content,
+              sessionId: data.sessionId,
+            };
+          }
+          request = await axios.post(urlTypebot, reqData);
+
+          await this.sendWAMessage(
+            instance,
+            session,
+            {
+              expire: expire,
+              keywordFinish: keywordFinish,
+              delayMessage: delayMessage,
+              unknownMessage: unknownMessage,
+              listeningFromMe: listeningFromMe,
+              stopBotFromMe: stopBotFromMe,
+              keepOpen: keepOpen,
+            },
+            remoteJid,
+            request.data.messages,
+            request.data.input,
+            request.data.clientSideActions,
+          );
+        } catch (error) {
+          this.logger.error(error);
+          return;
+        }
+      }
       return;
     }
+
+    await this.prismaRepository.typebotSession.update({
+      where: {
+        id: session.id,
+      },
+      data: {
+        status: 'opened',
+        awaitUser: false,
+      },
+    });
+
+    if (!content) {
+      if (unknownMessage) {
+        this.waMonitor.waInstances[instance.instanceName].textMessage(
+          {
+            number: remoteJid.split('@')[0],
+            delay: delayMessage || 1000,
+            text: unknownMessage,
+          },
+          true,
+        );
+      }
+      return;
+    }
+
+    if (keywordFinish && content.toLowerCase() === keywordFinish.toLowerCase()) {
+      await this.prismaRepository.typebotSession.deleteMany({
+        where: {
+          typebotId: findTypebot.id,
+          remoteJid: remoteJid,
+        },
+      });
+      return;
+    }
+
+    const version = this.configService.get<Typebot>('TYPEBOT').API_VERSION;
+    let urlTypebot: string;
+    let reqData: {};
+    if (version === 'latest') {
+      urlTypebot = `${url}/api/v1/sessions/${session.sessionId.split('-')[1]}/continueChat`;
+      reqData = {
+        message: content,
+      };
+    } else {
+      urlTypebot = `${url}/api/v1/sendMessage`;
+      reqData = {
+        message: content,
+        sessionId: session.sessionId.split('-')[1],
+      };
+    }
+    const request = await axios.post(urlTypebot, reqData);
+
+    await this.sendWAMessage(
+      instance,
+      session,
+      {
+        expire: expire,
+        keywordFinish: keywordFinish,
+        delayMessage: delayMessage,
+        unknownMessage: unknownMessage,
+        listeningFromMe: listeningFromMe,
+        stopBotFromMe: stopBotFromMe,
+        keepOpen: keepOpen,
+      },
+      remoteJid,
+      request?.data?.messages,
+      request?.data?.input,
+      request?.data?.clientSideActions,
+    );
+
+    return;
   }
 }

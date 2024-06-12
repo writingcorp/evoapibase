@@ -1,3 +1,5 @@
+import { TriggerOperator, TriggerType } from '@prisma/client';
+
 export class Session {
   remoteJid?: string;
   sessionId?: string;
@@ -19,9 +21,25 @@ export class TypebotDto {
   url: string;
   typebot?: string;
   expire?: number;
-  keyword_finish?: string;
-  delay_message?: number;
-  unknown_message?: string;
-  listening_from_me?: boolean;
-  sessions?: Session[];
+  keywordFinish?: string;
+  delayMessage?: number;
+  unknownMessage?: string;
+  listeningFromMe?: boolean;
+  stopBotFromMe?: boolean;
+  keepOpen?: boolean;
+  debounceTime?: number;
+  triggerType?: TriggerType;
+  triggerOperator?: TriggerOperator;
+  triggerValue?: string;
+}
+
+export class TypebotSettingDto {
+  expire?: number;
+  keywordFinish?: string;
+  delayMessage?: number;
+  unknownMessage?: string;
+  listeningFromMe?: boolean;
+  stopBotFromMe?: boolean;
+  keepOpen?: boolean;
+  debounceTime?: number;
 }

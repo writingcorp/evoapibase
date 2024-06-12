@@ -1,7 +1,8 @@
+import { Proxy } from '@prisma/client';
+
 import { Logger } from '../../config/logger.config';
 import { InstanceDto } from '../dto/instance.dto';
 import { ProxyDto } from '../dto/proxy.dto';
-import { ProxyRaw } from '../models';
 import { WAMonitoringService } from './monitor.service';
 
 export class ProxyService {
@@ -10,15 +11,13 @@ export class ProxyService {
   private readonly logger = new Logger(ProxyService.name);
 
   public create(instance: InstanceDto, data: ProxyDto) {
-    this.logger.verbose('create proxy: ' + instance.instanceName);
     this.waMonitor.waInstances[instance.instanceName].setProxy(data);
 
     return { proxy: { ...instance, proxy: data } };
   }
 
-  public async find(instance: InstanceDto): Promise<ProxyRaw> {
+  public async find(instance: InstanceDto): Promise<Proxy> {
     try {
-      this.logger.verbose('find proxy: ' + instance.instanceName);
       const result = await this.waMonitor.waInstances[instance.instanceName].findProxy();
 
       if (Object.keys(result).length === 0) {
@@ -27,7 +26,7 @@ export class ProxyService {
 
       return result;
     } catch (error) {
-      return { enabled: false, proxy: null };
+      return null;
     }
   }
 }
